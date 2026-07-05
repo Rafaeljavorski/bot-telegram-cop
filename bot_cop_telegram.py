@@ -144,36 +144,72 @@ def obter_ticket_ativo_atendente(atendente_id):
 
 
 def painel_texto():
+    def minutos(dt_iso):
+        try:
+            dt = datetime.fromisoformat(dt_iso)
+            return int((datetime.now() - dt).total_seconds() // 60)
+        except:
+            return 0
+
     with db() as conn:
-        aguardando = conn.execute("SELECT COUNT(*) c FROM tickets WHERE status='aguardando'").fetchone()["c"]
-        atendimento = conn.execute("SELECT COUNT(*) c FROM tickets WHERE status='em_atendimento'").fetchone()["c"]
+        aguardando = conn.execute(
+            "SELECT * FROM tickets WHERE status='aguardando' ORDER BY id ASC"
+        ).fetchall()
+
+        atendimento = conn.execute(
+            "SELECT * FROM tickets WHERE status='em_atendimento' ORDER BY assumed_at ASC"
+        ).fetchall()
+
         finalizados = conn.execute("""
-            SELECT COUNT(*) c FROM tickets
-            WHERE status='finalizado' AND date(closed_at)=date('now','localtime')
-        """).fetchone()["c"]
-        ultimos = conn.execute("""
-            SELECT protocolo, user_name, categoria, status, atendente_nome, created_at
+            SELECT COUNT(*) c
             FROM tickets
-            WHERE status IN ('aguardando','em_atendimento')
-            ORDER BY id ASC LIMIT 15
-        """).fetchall()
+            WHERE status='finalizado'
+            AND date(closed_at)=date('now','localtime')
+        """).fetchone()["c"]
+
+    maior_espera = 0
+    if aguardando:
+        maior_espera = max(minutos(r["created_at"]) for r in aguardando)
 
     linhas = [
-        "📋 *PAINEL COP - ATENDIMENTOS*",
+        "📋 *FILA COP - ATENDIMENTOS*",
         "",
-        f"🟡 Aguardando: *{aguardando}*",
-        f"🟢 Em atendimento: *{atendimento}*",
+        f"🟡 Aguardando: *{len(aguardando)}*",
+        f"🟢 Em atendimento: *{len(atendimento)}*",
         f"✅ Finalizados hoje: *{finalizados}*",
+        f"⏱️ Maior espera: *{maior_espera} min*",
         "",
-        "*Fila atual:*",
+        "🟢 *EM ATENDIMENTO*",
     ]
-    if not ultimos:
-        linhas.append("Nenhum chamado aguardando.")
+
+    if atendimento:
+        for r in atendimento[:10]:
+            atendente = r["atendente_nome"] or "Sem atendente"
+            linhas.append(
+                f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']} - {atendente}"
+            )
     else:
-        for r in ultimos:
-            emoji = "🟡" if r["status"] == "aguardando" else "🟢"
-            atend = f" - {r['atendente_nome']}" if r["atendente_nome"] else ""
-            linhas.append(f"{emoji} {r['protocolo']} - {r['user_name']} - {r['categoria']}{atend}")
+        linhas.append("Nenhum atendimento em andamento.")
+
+    linhas.extend([
+        "",
+        "🟡 *AGUARDANDO*",
+    ])
+
+    if aguardando:
+        for r in aguardando[:20]:
+            espera = minutos(r["created_at"])
+            linhas.append(
+                f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']} - {espera} min"
+            )
+    else:
+        linhas.append("Fila vazia no momento.")
+
+    linhas.extend([
+        "",
+        f"🕘 Atualizado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    ])
+
     return "\n".join(linhas)
 
 
