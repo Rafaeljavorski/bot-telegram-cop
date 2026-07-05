@@ -1,5 +1,6 @@
 import os
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import logging
 from datetime import datetime
 
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 ATENDENTES_CHAT_ID = int(os.getenv("ATENDENTES_CHAT_ID", "0"))
-DATABASE_PATH = os.getenv("DATABASE_PATH", "cop_bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 ALERTA_ESPERA_MIN = int(os.getenv("ALERTA_ESPERA_MIN", "10"))
 
 ADM_IDS = [
@@ -37,6 +38,9 @@ ADM_IDS = [
 if not BOT_TOKEN:
     raise RuntimeError("Configure a variável TELEGRAM_BOT_TOKEN no Railway.")
 
+if not DATABASE_URL:
+    raise RuntimeError("Configure a variável DATABASE_URL no Railway.")
+
 usuarios_em_chamado = {}
 painel_message_id = None
 
@@ -45,72 +49,115 @@ def eh_admin(user_id: int) -> bool:
     return user_id in ADM_IDS
 
 
+class CursorResult:
+    def __init__(self, rows=None):
+        self._rows = rows or []
+        self.lastrowid = None
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return self._rows
+
+
+class DBWrapper:
+    def __init__(self):
+        self.conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            self.conn.rollback()
+        else:
+            self.conn.commit()
+        self.conn.close()
+
+    def cursor(self):
+        return self.conn.cursor()
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
+
+    def execute(self, sql, params=()):
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params)
+            if cur.description:
+                return CursorResult(cur.fetchall())
+            return CursorResult()
+
+
 def db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return DBWrapper()
 
 
 def add_column_if_missing(conn, table, column, ddl):
     try:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-    except sqlite3.OperationalError:
-        pass
-
+        with conn.cursor() as cur:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
 
 def init_db():
     with db() as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            protocolo TEXT UNIQUE,
-            user_id INTEGER,
-            user_name TEXT,
-            categoria TEXT,
-            contrato TEXT,
-            status TEXT,
-            atendente_id INTEGER,
-            atendente_nome TEXT,
-            fotos INTEGER DEFAULT 0,
-            created_at TEXT,
-            assumed_at TEXT,
-            closed_at TEXT,
-            last_message_at TEXT,
-            message_thread_id INTEGER,
-            subcategoria TEXT,
-            latitude REAL,
-            longitude REAL,
-            historico_enviado INTEGER DEFAULT 0,
-            alertado_espera INTEGER DEFAULT 0
-        )
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            protocolo TEXT,
-            sender_id INTEGER,
-            sender_name TEXT,
-            sender_role TEXT,
-            message_type TEXT,
-            text TEXT,
-            file_id TEXT,
-            latitude REAL,
-            longitude REAL,
-            created_at TEXT
-        )
-        """)
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS tickets (
+                id SERIAL PRIMARY KEY,
+                protocolo TEXT UNIQUE,
+                user_id BIGINT,
+                user_name TEXT,
+                categoria TEXT,
+                contrato TEXT,
+                status TEXT,
+                atendente_id BIGINT,
+                atendente_nome TEXT,
+                fotos INTEGER DEFAULT 0,
+                created_at TEXT,
+                assumed_at TEXT,
+                closed_at TEXT,
+                last_message_at TEXT,
+                message_thread_id BIGINT,
+                subcategoria TEXT,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                historico_enviado INTEGER DEFAULT 0,
+                alertado_espera INTEGER DEFAULT 0
+            )
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                protocolo TEXT,
+                sender_id BIGINT,
+                sender_name TEXT,
+                sender_role TEXT,
+                message_type TEXT,
+                text TEXT,
+                file_id TEXT,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                created_at TEXT
+            )
+            """)
+        conn.commit()
 
-        add_column_if_missing(conn, "tickets", "message_thread_id", "INTEGER")
+        add_column_if_missing(conn, "tickets", "message_thread_id", "BIGINT")
         add_column_if_missing(conn, "tickets", "subcategoria", "TEXT")
-        add_column_if_missing(conn, "tickets", "latitude", "REAL")
-        add_column_if_missing(conn, "tickets", "longitude", "REAL")
+        add_column_if_missing(conn, "tickets", "latitude", "DOUBLE PRECISION")
+        add_column_if_missing(conn, "tickets", "longitude", "DOUBLE PRECISION")
         add_column_if_missing(conn, "tickets", "historico_enviado", "INTEGER DEFAULT 0")
         add_column_if_missing(conn, "tickets", "alertado_espera", "INTEGER DEFAULT 0")
 
         add_column_if_missing(conn, "messages", "file_id", "TEXT")
-        add_column_if_missing(conn, "messages", "latitude", "REAL")
-        add_column_if_missing(conn, "messages", "longitude", "REAL")
-
+        add_column_if_missing(conn, "messages", "latitude", "DOUBLE PRECISION")
+        add_column_if_missing(conn, "messages", "longitude", "DOUBLE PRECISION")
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
@@ -127,24 +174,26 @@ def minutos(dt_iso):
 def criar_ticket_db(user_id, user_name, categoria, contrato=None, subcategoria=None):
     created = now()
     with db() as conn:
-        cur = conn.execute("""
-            INSERT INTO tickets
-            (user_id, user_name, categoria, contrato, subcategoria, status, created_at, last_message_at)
-            VALUES (?, ?, ?, ?, ?, 'aguardando', ?, ?)
-        """, (user_id, user_name, categoria, contrato, subcategoria, created, created))
-        ticket_id = cur.lastrowid
-        protocolo = f"COP-{ticket_id:04d}"
-        conn.execute("UPDATE tickets SET protocolo=? WHERE id=?", (protocolo, ticket_id))
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO tickets
+                (user_id, user_name, categoria, contrato, subcategoria, status, created_at, last_message_at)
+                VALUES (%s, %s, %s, %s, %s, 'aguardando', %s, %s)
+                RETURNING id
+            """, (user_id, user_name, categoria, contrato, subcategoria, created, created))
+            ticket_id = cur.fetchone()["id"]
+            protocolo = f"COP-{ticket_id:04d}"
+            cur.execute("UPDATE tickets SET protocolo=%s WHERE id=%s", (protocolo, ticket_id))
     return protocolo
 
 
 def atualizar_ticket(protocolo, **kwargs):
     if not kwargs:
         return
-    cols = ", ".join([f"{k}=?" for k in kwargs])
+    cols = ", ".join([f"{k}=%s" for k in kwargs])
     values = list(kwargs.values()) + [protocolo]
     with db() as conn:
-        conn.execute(f"UPDATE tickets SET {cols} WHERE protocolo=?", values)
+        conn.execute(f"UPDATE tickets SET {cols} WHERE protocolo=%s", values)
 
 
 def registrar_msg(protocolo, sender_id, sender_name, sender_role, message_type, text="", file_id=None, latitude=None, longitude=None):
@@ -152,7 +201,7 @@ def registrar_msg(protocolo, sender_id, sender_name, sender_role, message_type, 
         conn.execute("""
             INSERT INTO messages
             (protocolo, sender_id, sender_name, sender_role, message_type, text, file_id, latitude, longitude, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             protocolo,
             sender_id,
@@ -165,12 +214,12 @@ def registrar_msg(protocolo, sender_id, sender_name, sender_role, message_type, 
             longitude,
             now(),
         ))
-        conn.execute("UPDATE tickets SET last_message_at=? WHERE protocolo=?", (now(), protocolo))
+        conn.execute("UPDATE tickets SET last_message_at=%s WHERE protocolo=%s", (now(), protocolo))
 
 
 def buscar_ticket(protocolo):
     with db() as conn:
-        row = conn.execute("SELECT * FROM tickets WHERE protocolo=?", (protocolo,)).fetchone()
+        row = conn.execute("SELECT * FROM tickets WHERE protocolo=%s", (protocolo,)).fetchone()
         return dict(row) if row else None
 
 
@@ -180,7 +229,7 @@ def buscar_ticket_por_thread(thread_id):
     with db() as conn:
         row = conn.execute("""
             SELECT * FROM tickets
-            WHERE message_thread_id=? AND status IN ('aguardando','em_atendimento')
+            WHERE message_thread_id=%s AND status IN ('aguardando','em_atendimento')
             ORDER BY id DESC LIMIT 1
         """, (thread_id,)).fetchone()
         return dict(row) if row else None
@@ -190,7 +239,7 @@ def obter_ticket_ativo_usuario(user_id):
     with db() as conn:
         row = conn.execute("""
             SELECT * FROM tickets
-            WHERE user_id=? AND status IN ('aguardando','em_atendimento')
+            WHERE user_id=%s AND status IN ('aguardando','em_atendimento')
             ORDER BY id DESC LIMIT 1
         """, (user_id,)).fetchone()
         return dict(row) if row else None
@@ -211,7 +260,7 @@ def painel_texto():
         atendimento = conn.execute("SELECT * FROM tickets WHERE status='em_atendimento' ORDER BY assumed_at ASC").fetchall()
         finalizados = conn.execute("""
             SELECT COUNT(*) c FROM tickets
-            WHERE status='finalizado' AND date(closed_at)=date('now','localtime')
+            WHERE status='finalizado' AND DATE(closed_at::timestamp)=CURRENT_DATE
         """).fetchone()["c"]
 
     maior_espera = max([minutos(r["created_at"]) for r in aguardando] or [0])
@@ -393,7 +442,7 @@ async def reenviar_historico_para_topico(context, protocolo):
     with db() as conn:
         msgs = conn.execute("""
             SELECT * FROM messages
-            WHERE protocolo=? AND sender_role='tecnico'
+            WHERE protocolo=%s AND sender_role='tecnico'
             ORDER BY id ASC
         """, (protocolo,)).fetchall()
 
@@ -477,12 +526,12 @@ async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         rows = conn.execute("""
             SELECT * FROM tickets
-            WHERE protocolo LIKE ?
-               OR contrato LIKE ?
-               OR user_name LIKE ?
-               OR categoria LIKE ?
-               OR subcategoria LIKE ?
-               OR atendente_nome LIKE ?
+            WHERE protocolo LIKE %s
+               OR contrato LIKE %s
+               OR user_name LIKE %s
+               OR categoria LIKE %s
+               OR subcategoria LIKE %s
+               OR atendente_nome LIKE %s
             ORDER BY id DESC
             LIMIT 10
         """, (like, like, like, like, like, like)).fetchall()
