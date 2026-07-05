@@ -1,13 +1,10 @@
-# Bot COP PostgreSQL - travas e tópico final
+# Bot COP - sem mensagens de fixação
 
-Alterações:
-- Botão Assumir só funciona uma vez.
-- Se clicar Assumir novamente, avisa que já foi assumido.
-- Botão Finalizar só funciona uma vez.
-- Se clicar Finalizar novamente, avisa que já foi finalizado.
-- Após assumir, aparece nova mensagem com botões apenas de Finalizar e Devolver.
-- Ao finalizar, o tópico é renomeado para FINALIZADO.
-- A mensagem de finalização formatada fica por último no tópico quando possível.
+Correções:
+- Remove o pin automático do painel e do cabeçalho do tópico.
+- Evita mensagens automáticas "COP CIP Telecom fixou..." no grupo.
+- Ignora mensagens de serviço do Telegram, para não responder "Use /start" no grupo.
+- Mantém travas de Assumir/Finalizar e PostgreSQL.
 
 Substitua no GitHub:
 - bot_cop_telegram.py

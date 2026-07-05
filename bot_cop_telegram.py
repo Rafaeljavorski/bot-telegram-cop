@@ -329,14 +329,6 @@ async def atualizar_painel(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=teclado_painel(),
             )
             painel_message_id = msg.message_id
-            try:
-                await context.bot.pin_chat_message(
-                    chat_id=ATENDENTES_CHAT_ID,
-                    message_id=painel_message_id,
-                    disable_notification=True,
-                )
-            except Exception:
-                pass
     except Exception as e:
         logger.warning("Erro ao atualizar painel: %s", e)
         msg = await context.bot.send_message(
@@ -418,15 +410,6 @@ async def enviar_cabecalho_topico(context, protocolo):
         parse_mode="Markdown",
         reply_markup=teclado,
     )
-
-    try:
-        await context.bot.pin_chat_message(
-            chat_id=ATENDENTES_CHAT_ID,
-            message_id=msg.message_id,
-            disable_notification=True,
-        )
-    except Exception:
-        pass
 
 
 async def reenviar_historico_para_topico(context, protocolo):
@@ -928,6 +911,16 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user = update.effective_user
 
+    # Ignora mensagens automáticas do Telegram, como "fixou mensagem",
+    # alteração de tópico, entrada/saída de membros etc.
+    # Isso evita o bot responder "Use /start..." no grupo.
+    if not msg or getattr(msg, "pinned_message", None):
+        return
+
+    if user and getattr(user, "is_bot", False):
+        return
+
+
     # Limpa sessão antiga se o usuário não tem ticket ativo.
     ticket_ativo = obter_ticket_ativo_usuario(user.id)
     if not ticket_ativo and context.user_data.get("protocolo"):
@@ -1254,7 +1247,10 @@ def main():
     app.add_handler(CommandHandler("adm", adm))
     app.add_handler(CommandHandler("buscar", buscar))
     app.add_handler(CallbackQueryHandler(botoes))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, tratar_mensagem))
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.VOICE | filters.LOCATION) & ~filters.COMMAND,
+        tratar_mensagem
+    ))
 
     try:
         app.job_queue.run_repeating(alerta_espera_job, interval=60, first=60)
