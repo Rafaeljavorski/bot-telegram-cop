@@ -647,7 +647,16 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
 
     if ticket["status"] == "finalizado":
         if origem_chat_id:
-            await context.bot.send_message(chat_id=origem_chat_id, text="Esse chamado já foi finalizado.")
+            await context.bot.send_message(chat_id=origem_chat_id, text=f"⚠️ {protocolo} já foi finalizado.")
+        return
+
+    if ticket["status"] == "em_atendimento":
+        if origem_chat_id:
+            atendente = ticket.get("atendente_nome") or "outro atendente"
+            await context.bot.send_message(
+                chat_id=origem_chat_id,
+                text=f"⚠️ {protocolo} já foi assumido por {atendente}."
+            )
         return
 
     if not ticket.get("message_thread_id"):
@@ -687,11 +696,17 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
     await reenviar_historico_para_topico(context, protocolo)
 
     if ticket.get("message_thread_id"):
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Finalizar {protocolo}", callback_data=f"topico_finalizar:{protocolo}")],
+            [InlineKeyboardButton("🔄 Devolver para fila", callback_data=f"adm_devolver:{protocolo}")],
+        ])
+
         await context.bot.send_message(
             chat_id=ATENDENTES_CHAT_ID,
             message_thread_id=ticket["message_thread_id"],
             text=f"✅ Atendimento assumido por *{user.full_name}*.",
             parse_mode="Markdown",
+            reply_markup=teclado,
         )
 
     await atualizar_painel(context)
@@ -704,14 +719,14 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
             await context.bot.send_message(chat_id=chat_id, text="Chamado não encontrado.")
         return
 
+    if ticket["status"] == "finalizado":
+        if chat_id:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {protocolo} já foi finalizado.")
+        return
+
     if not admin and ticket.get("atendente_id") and ticket["atendente_id"] != user.id:
         if chat_id:
             await context.bot.send_message(chat_id=chat_id, text="Você não é o responsável por esse chamado.")
-        return
-
-    if ticket["status"] == "finalizado":
-        if chat_id:
-            await context.bot.send_message(chat_id=chat_id, text=f"{protocolo} já estava finalizado.")
         return
 
     atualizar_ticket(protocolo, status="finalizado", closed_at=now(), last_message_at=now())
@@ -739,12 +754,7 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
         except Exception:
             pass
 
-        await context.bot.send_message(
-            chat_id=ATENDENTES_CHAT_ID,
-            message_thread_id=ticket["message_thread_id"],
-            text=f"✅ Atendimento finalizado por {user.full_name}.",
-        )
-
+        # Fecha primeiro para a mensagem automática do Telegram não ficar por último.
         try:
             await context.bot.close_forum_topic(
                 chat_id=ATENDENTES_CHAT_ID,
@@ -752,6 +762,43 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
             )
         except Exception:
             pass
+
+        final_text = (
+            "━━━━━━━━━━━━━━\n"
+            "✅ *Atendimento Finalizado*\n"
+            f"🎫 Protocolo: *{protocolo}*\n"
+            f"👨‍💻 Atendente: *{user.full_name}*\n"
+            f"🕒 Horário: *{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}*\n"
+            "━━━━━━━━━━━━━━"
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=ATENDENTES_CHAT_ID,
+                message_thread_id=ticket["message_thread_id"],
+                text=final_text,
+                parse_mode="Markdown",
+                reply_markup=None,
+            )
+        except Exception:
+            try:
+                await context.bot.reopen_forum_topic(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    message_thread_id=ticket["message_thread_id"],
+                )
+                await context.bot.send_message(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    message_thread_id=ticket["message_thread_id"],
+                    text=final_text,
+                    parse_mode="Markdown",
+                    reply_markup=None,
+                )
+                await context.bot.close_forum_topic(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    message_thread_id=ticket["message_thread_id"],
+                )
+            except Exception:
+                pass
 
     await atualizar_painel(context)
 
