@@ -55,7 +55,8 @@ class Chamado:
 chamados: Dict[int, Chamado] = {}
 fila_aguardando: List[int] = []
 em_atendimento: List[int] = []
-user_chamado_aberto: Dict[int, int] = {}
+user_chamado_aberto: Dict[int, int] = {}          # técnico/cliente -> chamado
+atendente_chamado_aberto: Dict[int, int] = {}     # atendente -> chamado assumido
 user_etapa: Dict[int, str] = {}
 painel_msg_id: Optional[int] = None
 proximo_id = 1
@@ -83,14 +84,11 @@ def username_usuario(update: Update) -> str:
 
 
 def montar_texto_painel() -> str:
-    total_aguardando = len(fila_aguardando)
-    total_atendimento = len(em_atendimento)
-
     texto = [
         "📋 *FILA COP - ATENDIMENTOS*",
         "",
-        f"🟡 Aguardando: *{total_aguardando}*",
-        f"🟢 Em atendimento: *{total_atendimento}*",
+        f"🟡 Aguardando: *{len(fila_aguardando)}*",
+        f"🟢 Em atendimento: *{len(em_atendimento)}*",
         "",
         "🟢 *EM ATENDIMENTO*",
     ]
@@ -98,15 +96,12 @@ def montar_texto_painel() -> str:
     if em_atendimento:
         for pos, cid in enumerate(em_atendimento[-10:], start=1):
             c = chamados[cid]
-            texto.append(
-                f"{pos}. #{c.id} — {c.nome} — {c.fila} — 👤 {c.atendente_nome or 'Atendente'}"
-            )
+            texto.append(f"{pos}. #{c.id} — {c.nome} — {c.fila} — 👤 {c.atendente_nome or 'Atendente'}")
     else:
         texto.append("Nenhum atendimento em andamento.")
 
     texto += ["", "🟡 *AGUARDANDO*"]
     if fila_aguardando:
-        # Mostra os primeiros 20 para não virar uma mensagem gigante
         for pos, cid in enumerate(fila_aguardando[:20], start=1):
             c = chamados[cid]
             texto.append(f"{pos}. #{c.id} — {c.nome} — {c.fila} — {c.criado_em}")
@@ -119,10 +114,9 @@ def montar_texto_painel() -> str:
     return "\n".join(texto)
 
 
-def botoes_atendimento(chamado_id: int) -> InlineKeyboardMarkup:
+def botoes_finalizar(chamado_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Assumir este", callback_data=f"chamado:assumir:{chamado_id}")],
-        [InlineKeyboardButton("✅ Finalizar", callback_data=f"chamado:finalizar:{chamado_id}")],
+        [InlineKeyboardButton("✅ Finalizar atendimento", callback_data=f"chamado:finalizar:{chamado_id}")]
     ])
 
 
@@ -174,6 +168,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     fila = query.data.split(":", 1)[1]
 
+    context.user_data.clear()
     context.user_data["fila"] = fila
     user_etapa[query.from_user.id] = "contrato"
 
@@ -184,6 +179,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receber_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Se for conversa após chamado assumido, faz ponte técnico <-> atendente
+    if await encaminhar_conversa(update, context):
+        return
+
     user_id = update.effective_user.id
     etapa = user_etapa.get(user_id)
 
@@ -199,10 +198,7 @@ async def receber_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             resize_keyboard=True,
             one_time_keyboard=True,
         )
-        await update.message.reply_text(
-            "📍 Agora envie sua localização atual pelo botão abaixo.",
-            reply_markup=botao_local,
-        )
+        await update.message.reply_text("📍 Agora envie sua localização atual pelo botão abaixo.", reply_markup=botao_local)
         return
 
     if etapa == "resumo":
@@ -214,6 +210,9 @@ async def receber_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receber_localizacao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await encaminhar_conversa(update, context):
+        return
+
     user_id = update.effective_user.id
     loc = update.message.location
     context.user_data["localizacao"] = f"https://maps.google.com/?q={loc.latitude},{loc.longitude}"
@@ -234,13 +233,14 @@ async def receber_localizacao(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     else:
         user_etapa[user_id] = "resumo"
-        await update.message.reply_text(
-            "📄 Resuma sua solicitação em poucas palavras:",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        await update.message.reply_text("📄 Resuma sua solicitação em poucas palavras:", reply_markup=ReplyKeyboardRemove())
 
 
 async def receber_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Se já estiver em atendimento, foto vira conversa e vai para o outro lado
+    if await encaminhar_conversa(update, context):
+        return
+
     user_id = update.effective_user.id
     if user_etapa.get(user_id) != "fotos":
         return
@@ -268,9 +268,7 @@ async def criar_chamado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in user_chamado_aberto:
         chamado_existente = chamados.get(user_chamado_aberto[user_id])
         if chamado_existente and chamado_existente.status != "finalizado":
-            await update.message.reply_text(
-                f"⚠️ Você já possui um chamado aberto: #{chamado_existente.id}\nAguarde o atendimento ou peça para finalizarem."
-            )
+            await update.message.reply_text(f"⚠️ Você já possui um chamado aberto: #{chamado_existente.id}\nAguarde o atendimento ou peça para finalizarem.")
             return
 
     cid = proximo_id
@@ -292,21 +290,20 @@ async def criar_chamado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fila_aguardando.append(cid)
     user_chamado_aberto[user_id] = cid
     user_etapa.pop(user_id, None)
+    context.user_data.clear()
 
     await update.message.reply_text(
         f"✅ Seu chamado entrou na fila.\n\n🆔 Chamado: #{cid}\n📋 Fila: {chamado.fila}\n\nAguarde, um atendente irá assumir seu atendimento.",
         reply_markup=ReplyKeyboardRemove(),
     )
-
-    # Atualiza apenas o painel, sem jogar 50 mensagens no grupo.
     await atualizar_painel(context)
 
 
 async def fila_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     acao = query.data.split(":", 1)[1]
+
     if acao == "atualizar":
         await atualizar_painel(context)
         return
@@ -324,10 +321,7 @@ async def chamado_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     _, acao, cid_txt = query.data.split(":")
     cid = int(cid_txt)
-
-    if acao == "assumir":
-        await assumir_chamado(cid, query, context)
-    elif acao == "finalizar":
+    if acao == "finalizar":
         await finalizar_chamado(cid, query, context)
 
 
@@ -336,7 +330,6 @@ async def assumir_chamado(cid: int, query, context: ContextTypes.DEFAULT_TYPE):
     if not chamado:
         await query.answer("Chamado não encontrado.", show_alert=True)
         return
-
     if chamado.status != "aguardando":
         await query.answer("Esse chamado já foi assumido ou finalizado.", show_alert=True)
         return
@@ -349,22 +342,22 @@ async def assumir_chamado(cid: int, query, context: ContextTypes.DEFAULT_TYPE):
         fila_aguardando.remove(cid)
     if cid not in em_atendimento:
         em_atendimento.append(cid)
+    atendente_chamado_aberto[chamado.atendente_id] = cid
 
-    # Mensagem para o técnico/cliente que abriu o chamado
     try:
         await context.bot.send_message(
             chat_id=chamado.user_id,
             text=(
                 "🔷 *CIP Telecom*\n\n"
                 f"Seu atendimento #{chamado.id} foi iniciado por:\n"
-                f"👤 *{chamado.atendente_nome}*"
+                f"👤 *{chamado.atendente_nome}*\n\n"
+                "A partir de agora, envie suas mensagens aqui mesmo. O COP receberá e responderá por este chat."
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as e:
         logger.warning("Nao consegui avisar usuario %s: %s", chamado.user_id, e)
 
-    # Mensagem privada para o atendente que assumiu
     try:
         await context.bot.send_message(
             chat_id=chamado.atendente_id,
@@ -375,24 +368,19 @@ async def assumir_chamado(cid: int, query, context: ContextTypes.DEFAULT_TYPE):
                 f"👤 Técnico: {chamado.nome} {chamado.username}\n"
                 f"📄 Contrato: {chamado.contrato or 'não informado'}\n"
                 f"📍 Localização: {chamado.localizacao or 'não enviada'}\n"
-                f"📝 Resumo: {chamado.resumo or 'sem resumo'}"
+                f"📝 Resumo: {chamado.resumo or 'sem resumo'}\n\n"
+                "💬 Responda aqui no privado do bot. Sua mensagem será enviada ao técnico."
             ),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Finalizar atendimento", callback_data=f"chamado:finalizar:{chamado.id}")]
-            ]),
+            reply_markup=botoes_finalizar(chamado.id),
         )
     except Exception as e:
         logger.warning("Nao consegui enviar privado ao atendente %s: %s", chamado.atendente_id, e)
-        await query.answer(
-            "Você assumiu, mas abra o bot no privado e clique em /start para receber detalhes.",
-            show_alert=True,
-        )
+        await query.answer("Você assumiu, mas abra o bot no privado e clique em /start para receber e responder.", show_alert=True)
 
-    # Envia fotos no privado do atendente, se houver
     for file_id in chamado.fotos[:10]:
         try:
-            await context.bot.send_photo(chat_id=chamado.atendente_id, photo=file_id)
+            await context.bot.send_photo(chat_id=chamado.atendente_id, photo=file_id, caption=f"📸 Evidência do chamado #{chamado.id}")
         except Exception as e:
             logger.warning("Falha ao enviar foto ao atendente: %s", e)
 
@@ -404,12 +392,9 @@ async def finalizar_chamado(cid: int, query, context: ContextTypes.DEFAULT_TYPE)
     if not chamado:
         await query.answer("Chamado não encontrado.", show_alert=True)
         return
-
     if chamado.status == "finalizado":
         await query.answer("Esse chamado já foi finalizado.", show_alert=True)
         return
-
-    # Apenas quem assumiu pode finalizar. Se quiser liberar para qualquer atendente, remova este bloco.
     if chamado.atendente_id and chamado.atendente_id != query.from_user.id:
         await query.answer("Somente o atendente que assumiu pode finalizar.", show_alert=True)
         return
@@ -420,6 +405,8 @@ async def finalizar_chamado(cid: int, query, context: ContextTypes.DEFAULT_TYPE)
     if cid in em_atendimento:
         em_atendimento.remove(cid)
     user_chamado_aberto.pop(chamado.user_id, None)
+    if chamado.atendente_id:
+        atendente_chamado_aberto.pop(chamado.atendente_id, None)
 
     await context.bot.send_message(
         chat_id=chamado.user_id,
@@ -430,16 +417,69 @@ async def finalizar_chamado(cid: int, query, context: ContextTypes.DEFAULT_TYPE)
         ),
         parse_mode=ParseMode.MARKDOWN,
     )
-
     try:
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text=f"✅ Atendimento #{chamado.id} finalizado com sucesso.",
-        )
+        await context.bot.send_message(chat_id=query.from_user.id, text=f"✅ Atendimento #{chamado.id} finalizado com sucesso.")
     except Exception:
         pass
-
     await atualizar_painel(context)
+
+
+async def encaminhar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Faz a ponte privado técnico <-> privado atendente durante atendimento."""
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return False
+
+    remetente_id = update.effective_user.id
+    cid = None
+    destino_id = None
+    prefixo = None
+
+    # Técnico/cliente mandando para o COP
+    cid_user = user_chamado_aberto.get(remetente_id)
+    if cid_user:
+        c = chamados.get(cid_user)
+        if c and c.status == "em_atendimento" and c.atendente_id:
+            cid = cid_user
+            destino_id = c.atendente_id
+            prefixo = f"💬 *Técnico {c.nome}* — Chamado #{c.id}:"
+
+    # Atendente mandando para técnico
+    if not destino_id:
+        cid_att = atendente_chamado_aberto.get(remetente_id)
+        if cid_att:
+            c = chamados.get(cid_att)
+            if c and c.status == "em_atendimento":
+                cid = cid_att
+                destino_id = c.user_id
+                prefixo = f"💬 *COP {c.atendente_nome or 'Atendente'}* — Chamado #{c.id}:"
+
+    if not destino_id or not cid:
+        return False
+
+    msg = update.message
+    try:
+        if msg.text and not msg.text.startswith("/"):
+            await context.bot.send_message(chat_id=destino_id, text=f"{prefixo}\n\n{msg.text}", parse_mode=ParseMode.MARKDOWN)
+        elif msg.photo:
+            await context.bot.send_photo(chat_id=destino_id, photo=msg.photo[-1].file_id, caption=prefixo, parse_mode=ParseMode.MARKDOWN)
+        elif msg.document:
+            await context.bot.send_document(chat_id=destino_id, document=msg.document.file_id, caption=prefixo, parse_mode=ParseMode.MARKDOWN)
+        elif msg.video:
+            await context.bot.send_video(chat_id=destino_id, video=msg.video.file_id, caption=prefixo, parse_mode=ParseMode.MARKDOWN)
+        elif msg.audio:
+            await context.bot.send_audio(chat_id=destino_id, audio=msg.audio.file_id, caption=prefixo, parse_mode=ParseMode.MARKDOWN)
+        elif msg.voice:
+            await context.bot.send_voice(chat_id=destino_id, voice=msg.voice.file_id, caption=prefixo, parse_mode=ParseMode.MARKDOWN)
+        elif msg.location:
+            await context.bot.send_message(chat_id=destino_id, text=prefixo, parse_mode=ParseMode.MARKDOWN)
+            await context.bot.send_location(chat_id=destino_id, latitude=msg.location.latitude, longitude=msg.location.longitude)
+        else:
+            await context.bot.copy_message(chat_id=destino_id, from_chat_id=msg.chat_id, message_id=msg.message_id)
+        return True
+    except Exception as e:
+        logger.warning("Falha ao encaminhar conversa do chamado %s: %s", cid, e)
+        await msg.reply_text("⚠️ Não consegui enviar essa mensagem. Verifique se a outra pessoa iniciou o bot no privado.")
+        return True
 
 
 async def erro_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -458,9 +498,10 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, receber_foto))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^finalizar fotos$"), finalizar_fotos))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receber_texto))
+    app.add_handler(MessageHandler((filters.Document.ALL | filters.VIDEO | filters.VOICE | filters.AUDIO) & ~filters.COMMAND, encaminhar_conversa))
     app.add_error_handler(erro_handler)
 
-    logger.info("Bot COP iniciado")
+    logger.info("Bot COP iniciado com ponte técnico <-> atendente")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
