@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 ATENDENTES_CHAT_ID = int(os.getenv("ATENDENTES_CHAT_ID", "0"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "cop_bot.db")
+ALERTA_ESPERA_MIN = int(os.getenv("ALERTA_ESPERA_MIN", "10"))
 
 ADM_IDS = [
     int(x.strip())
@@ -79,7 +80,8 @@ def init_db():
             subcategoria TEXT,
             latitude REAL,
             longitude REAL,
-            historico_enviado INTEGER DEFAULT 0
+            historico_enviado INTEGER DEFAULT 0,
+            alerta_espera_enviado INTEGER DEFAULT 0
         )
         """)
         conn.execute("""
@@ -104,6 +106,7 @@ def init_db():
         add_column_if_missing(conn, "tickets", "latitude", "REAL")
         add_column_if_missing(conn, "tickets", "longitude", "REAL")
         add_column_if_missing(conn, "tickets", "historico_enviado", "INTEGER DEFAULT 0")
+        add_column_if_missing(conn, "tickets", "alerta_espera_enviado", "INTEGER DEFAULT 0")
 
         add_column_if_missing(conn, "messages", "file_id", "TEXT")
         add_column_if_missing(conn, "messages", "latitude", "REAL")
@@ -1003,13 +1006,119 @@ async def encaminhar_mensagem(msg, context, destino, cabecalho, thread_id=None):
             pass
 
 
+
+async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    termo = " ".join(context.args).strip() if context.args else ""
+    if not termo:
+        await update.message.reply_text(
+            "🔎 Use assim:\n/buscar COP-0001\nou\n/buscar 7163621"
+        )
+        return
+
+    like = f"%{termo}%"
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT * FROM tickets
+            WHERE protocolo LIKE ?
+               OR contrato LIKE ?
+               OR user_name LIKE ?
+               OR categoria LIKE ?
+               OR subcategoria LIKE ?
+            ORDER BY id DESC
+            LIMIT 10
+        """, (like, like, like, like, like)).fetchall()
+
+    if not rows:
+        await update.message.reply_text(f"🔎 Nenhum atendimento encontrado para: {termo}")
+        return
+
+    linhas = [f"🔎 *Resultado da busca:* `{termo}`", ""]
+    botoes = []
+    for r in rows:
+        sub = f" / {r['subcategoria']}" if r['subcategoria'] else ""
+        atendente = r['atendente_nome'] or "-"
+        espera = minutos(r['created_at']) if r['status'] == 'aguardando' else "-"
+        linhas.extend([
+            f"🎫 *{r['protocolo']}*",
+            f"👤 Técnico: {r['user_name']}",
+            f"📂 Fila: {r['categoria']}{sub}",
+            f"📄 Contrato: {r['contrato'] or '-'}",
+            f"📌 Status: {r['status']}",
+            f"👨‍💻 Atendente: {atendente}",
+            f"⏱️ Espera: {espera} min" if espera != '-' else "",
+            "",
+        ])
+        if r['status'] == 'aguardando':
+            botoes.append([InlineKeyboardButton(f"✅ Assumir {r['protocolo']}", callback_data=f"topico_assumir:{r['protocolo']}")])
+        elif r['status'] == 'em_atendimento':
+            botoes.append([InlineKeyboardButton(f"✅ Finalizar {r['protocolo']}", callback_data=f"topico_finalizar:{r['protocolo']}")])
+
+    await update.message.reply_text(
+        "\n".join([l for l in linhas if l != ""]),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(botoes) if botoes else None,
+    )
+
+
+async def verificar_alertas_espera(context: ContextTypes.DEFAULT_TYPE):
+    """Envia alerta no grupo quando um chamado ficar aguardando além do limite."""
+    if not ATENDENTES_CHAT_ID:
+        return
+
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT * FROM tickets
+            WHERE status='aguardando'
+              AND COALESCE(alerta_espera_enviado, 0)=0
+            ORDER BY id ASC
+            LIMIT 20
+        """).fetchall()
+
+    for r in rows:
+        espera = minutos(r['created_at'])
+        if espera < ALERTA_ESPERA_MIN:
+            continue
+
+        sub = f" / {r['subcategoria']}" if r['subcategoria'] else ""
+        texto = (
+            f"🚨 *Alerta de espera*\n\n"
+            f"🎫 *{r['protocolo']}*\n"
+            f"👤 Técnico: *{r['user_name']}*\n"
+            f"📂 Fila: *{r['categoria']}{sub}*\n"
+            f"📄 Contrato: *{r['contrato'] or '-'}*\n"
+            f"⏱️ Aguardando há *{espera} min*"
+        )
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Assumir {r['protocolo']}", callback_data=f"topico_assumir:{r['protocolo']}")],
+            [InlineKeyboardButton("🔄 Atualizar painel", callback_data="atualizar_painel")],
+        ])
+
+        try:
+            await context.bot.send_message(
+                chat_id=ATENDENTES_CHAT_ID,
+                text=texto,
+                parse_mode="Markdown",
+                reply_markup=teclado,
+            )
+            atualizar_ticket(r['protocolo'], alerta_espera_enviado=1)
+        except Exception as e:
+            logger.warning("Erro ao enviar alerta de espera: %s", e)
+
+
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("adm", adm))
+    app.add_handler(CommandHandler("buscar", buscar))
     app.add_handler(CallbackQueryHandler(botoes))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, tratar_mensagem))
+
+    if app.job_queue:
+        app.job_queue.run_repeating(verificar_alertas_espera, interval=60, first=60)
+    else:
+        logger.warning("JobQueue não está disponível. Para alerta automático, use python-telegram-bot[job-queue].")
+
     app.run_polling()
 
 
