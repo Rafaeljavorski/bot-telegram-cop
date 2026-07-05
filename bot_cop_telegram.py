@@ -81,7 +81,7 @@ def init_db():
             latitude REAL,
             longitude REAL,
             historico_enviado INTEGER DEFAULT 0,
-            alerta_espera_enviado INTEGER DEFAULT 0
+            alertado_espera INTEGER DEFAULT 0
         )
         """)
         conn.execute("""
@@ -100,13 +100,12 @@ def init_db():
         )
         """)
 
-        # Migrações para bancos antigos
         add_column_if_missing(conn, "tickets", "message_thread_id", "INTEGER")
         add_column_if_missing(conn, "tickets", "subcategoria", "TEXT")
         add_column_if_missing(conn, "tickets", "latitude", "REAL")
         add_column_if_missing(conn, "tickets", "longitude", "REAL")
         add_column_if_missing(conn, "tickets", "historico_enviado", "INTEGER DEFAULT 0")
-        add_column_if_missing(conn, "tickets", "alerta_espera_enviado", "INTEGER DEFAULT 0")
+        add_column_if_missing(conn, "tickets", "alertado_espera", "INTEGER DEFAULT 0")
 
         add_column_if_missing(conn, "messages", "file_id", "TEXT")
         add_column_if_missing(conn, "messages", "latitude", "REAL")
@@ -195,6 +194,15 @@ def obter_ticket_ativo_usuario(user_id):
             ORDER BY id DESC LIMIT 1
         """, (user_id,)).fetchone()
         return dict(row) if row else None
+
+
+def limpar_sessao_usuario(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    usuarios_em_chamado.pop(user_id, None)
+    # context.user_data only exists for current interacting user. We clear it in handlers when needed.
+    try:
+        context.user_data.clear()
+    except Exception:
+        pass
 
 
 def painel_texto():
@@ -340,7 +348,7 @@ async def enviar_cabecalho_topico(context, protocolo):
     sub = f"\n📌 Motivo: *{ticket['subcategoria']}*" if ticket.get("subcategoria") else ""
     loc = ""
     if ticket.get("latitude") and ticket.get("longitude"):
-        loc = f"\n📍 Localização recebida."
+        loc = "\n📍 Localização recebida."
 
     teclado = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Assumir {protocolo}", callback_data=f"topico_assumir:{protocolo}")],
@@ -407,39 +415,15 @@ async def reenviar_historico_para_topico(context, protocolo):
                 legenda += f"\n\n{m['text']}"
 
             if m["message_type"] == "text":
-                await context.bot.send_message(
-                    chat_id=ATENDENTES_CHAT_ID,
-                    message_thread_id=thread_id,
-                    text=legenda,
-                )
+                await context.bot.send_message(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, text=legenda)
             elif m["message_type"] == "photo":
-                await context.bot.send_photo(
-                    chat_id=ATENDENTES_CHAT_ID,
-                    message_thread_id=thread_id,
-                    photo=m["file_id"],
-                    caption=legenda,
-                )
+                await context.bot.send_photo(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, photo=m["file_id"], caption=legenda)
             elif m["message_type"] == "document":
-                await context.bot.send_document(
-                    chat_id=ATENDENTES_CHAT_ID,
-                    message_thread_id=thread_id,
-                    document=m["file_id"],
-                    caption=legenda,
-                )
+                await context.bot.send_document(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, document=m["file_id"], caption=legenda)
             elif m["message_type"] == "video":
-                await context.bot.send_video(
-                    chat_id=ATENDENTES_CHAT_ID,
-                    message_thread_id=thread_id,
-                    video=m["file_id"],
-                    caption=legenda,
-                )
+                await context.bot.send_video(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, video=m["file_id"], caption=legenda)
             elif m["message_type"] == "voice":
-                await context.bot.send_voice(
-                    chat_id=ATENDENTES_CHAT_ID,
-                    message_thread_id=thread_id,
-                    voice=m["file_id"],
-                    caption=legenda,
-                )
+                await context.bot.send_voice(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, voice=m["file_id"], caption=legenda)
             elif m["message_type"] == "location":
                 await context.bot.send_location(
                     chat_id=ATENDENTES_CHAT_ID,
@@ -447,11 +431,7 @@ async def reenviar_historico_para_topico(context, protocolo):
                     latitude=m["latitude"],
                     longitude=m["longitude"],
                 )
-                await context.bot.send_message(
-                    chat_id=ATENDENTES_CHAT_ID,
-                    message_thread_id=thread_id,
-                    text=legenda,
-                )
+                await context.bot.send_message(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, text=legenda)
         except Exception as e:
             logger.warning("Falha ao reenviar item do histórico: %s", e)
 
@@ -468,7 +448,7 @@ def tipo_mensagem(msg):
     if msg.voice:
         return "voice", msg.voice.file_id, ""
     if msg.location:
-        return "location", None, ""
+        return "location", None, "Localização enviada"
     return "text", None, msg.text or ""
 
 
@@ -485,6 +465,46 @@ async def adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Apenas administradores podem acessar este menu.")
         return
     await enviar_menu_adm(context, update.effective_chat.id)
+
+
+async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    termo = " ".join(context.args).strip()
+    if not termo:
+        await update.message.reply_text("Use assim:\n/buscar COP-0001\n/buscar 7163621\n/buscar Rafael\n/buscar PSW")
+        return
+
+    like = f"%{termo}%"
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT * FROM tickets
+            WHERE protocolo LIKE ?
+               OR contrato LIKE ?
+               OR user_name LIKE ?
+               OR categoria LIKE ?
+               OR subcategoria LIKE ?
+               OR atendente_nome LIKE ?
+            ORDER BY id DESC
+            LIMIT 10
+        """, (like, like, like, like, like, like)).fetchall()
+
+    if not rows:
+        await update.message.reply_text("Nenhum atendimento encontrado.")
+        return
+
+    linhas = ["🔎 *Resultado da busca:*", ""]
+    for r in rows:
+        sub = f" / {r['subcategoria']}" if r["subcategoria"] else ""
+        atendente = r["atendente_nome"] or "-"
+        linhas.append(
+            f"🎫 *{r['protocolo']}*\n"
+            f"👤 Técnico: {r['user_name']}\n"
+            f"📂 Fila: {r['categoria']}{sub}\n"
+            f"📄 Contrato: {r['contrato'] or '-'}\n"
+            f"📊 Status: {r['status']}\n"
+            f"👨‍💻 Atendente: {atendente}\n"
+        )
+
+    await update.message.reply_text("\n".join(linhas), parse_mode="Markdown")
 
 
 async def enviar_menu_adm(context, chat_id):
@@ -640,12 +660,22 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
             await context.bot.send_message(chat_id=chat_id, text="Você não é o responsável por esse chamado.")
         return
 
+    if ticket["status"] == "finalizado":
+        if chat_id:
+            await context.bot.send_message(chat_id=chat_id, text=f"{protocolo} já estava finalizado.")
+        return
+
     atualizar_ticket(protocolo, status="finalizado", closed_at=now(), last_message_at=now())
+    usuarios_em_chamado.pop(ticket["user_id"], None)
 
     try:
         await context.bot.send_message(
             chat_id=ticket["user_id"],
-            text=f"✅ Atendimento {protocolo} finalizado pelo COP."
+            text=(
+                f"✅ Atendimento {protocolo} finalizado pelo COP.\n\n"
+                "Se precisar abrir um novo atendimento, utilize /start."
+            ),
+            reply_markup=ReplyKeyboardRemove(),
         )
     except Exception:
         pass
@@ -802,6 +832,12 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user = update.effective_user
 
+    # Limpa sessão antiga se o usuário não tem ticket ativo.
+    ticket_ativo = obter_ticket_ativo_usuario(user.id)
+    if not ticket_ativo and context.user_data.get("protocolo"):
+        context.user_data.clear()
+        usuarios_em_chamado.pop(user.id, None)
+
     # Mensagem enviada dentro de um tópico do grupo: vai para o técnico correto.
     if update.effective_chat and update.effective_chat.id == ATENDENTES_CHAT_ID and msg.message_thread_id:
         ticket = buscar_ticket_por_thread(msg.message_thread_id)
@@ -866,11 +902,22 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await atualizar_painel(context)
         return
 
-    # PSW recebendo localização obrigatória
+    # PSW recebendo localização obrigatória.
     if context.user_data.get("etapa") == "localizacao":
         protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
         if not protocolo:
+            context.user_data.clear()
             await msg.reply_text("Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        ticket = buscar_ticket(protocolo)
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text(
+                "Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
             return
 
         if msg.location:
@@ -906,7 +953,18 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.text and msg.text.strip().lower() in ["✅ finalizar fotos", "finalizar fotos"]:
         protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
         if not protocolo:
+            context.user_data.clear()
             await msg.reply_text("Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        ticket = buscar_ticket(protocolo)
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text(
+                "Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
             return
 
         registrar_msg(protocolo, user.id, user.full_name, "tecnico", "finalizou_fotos", "Finalizou fotos")
@@ -914,7 +972,57 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Fotos recebidas.\n🎫 {protocolo}\n\nSeu atendimento entrou na fila do COP.",
             reply_markup=ReplyKeyboardRemove(),
         )
+
+        # Chamado já está na fila, mas continua aceitando novas evidências.
+        # Se o técnico enviar algo depois disso, será anexado ao histórico.
+        context.user_data["etapa"] = "aguardando_cop"
         await atualizar_painel(context)
+        return
+
+    # Técnico já finalizou as fotos e está aguardando COP.
+    # Novas fotos/mensagens são anexadas ao chamado sem pedir para finalizar novamente.
+    if context.user_data.get("etapa") == "aguardando_cop":
+        ticket = obter_ticket_ativo_usuario(user.id)
+
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text(
+                "Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        msg_type, file_id, text = tipo_mensagem(msg)
+
+        fotos = ticket.get("fotos") or 0
+        if msg_type in ["photo", "document", "video", "location"]:
+            fotos += 1
+
+        atualizar_ticket(ticket["protocolo"], fotos=fotos, last_message_at=now())
+        registrar_msg(
+            ticket["protocolo"],
+            user.id,
+            user.full_name,
+            "tecnico",
+            msg_type,
+            text,
+            file_id=file_id,
+            latitude=msg.location.latitude if msg.location else None,
+            longitude=msg.location.longitude if msg.location else None,
+        )
+
+        if ticket.get("message_thread_id"):
+            await encaminhar_mensagem(
+                msg,
+                context,
+                ATENDENTES_CHAT_ID,
+                f"📩 {ticket['protocolo']} - {user.full_name}",
+                thread_id=ticket["message_thread_id"],
+            )
+        else:
+            await msg.reply_text(f"✅ Informação adicionada ao chamado {ticket['protocolo']}.")
+
         return
 
     # Técnico enviando mensagem depois do chamado criado: vai para o tópico.
@@ -944,8 +1052,17 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Recebendo fotos/evidências antes de finalizar.
     if context.user_data.get("etapa") == "fotos":
         protocolo = context.user_data.get("protocolo")
+        ticket = buscar_ticket(protocolo) if protocolo else None
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text(
+                "Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
         if msg.photo or msg.document or msg.video or msg.location or msg.voice or msg.text:
-            ticket = buscar_ticket(protocolo)
             msg_type, file_id, text = tipo_mensagem(msg)
 
             if msg_type in ["photo", "document", "video", "location"]:
@@ -1006,103 +1123,32 @@ async def encaminhar_mensagem(msg, context, destino, cabecalho, thread_id=None):
             pass
 
 
-
-async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    termo = " ".join(context.args).strip() if context.args else ""
-    if not termo:
-        await update.message.reply_text(
-            "🔎 Use assim:\n/buscar COP-0001\nou\n/buscar 7163621"
-        )
-        return
-
-    like = f"%{termo}%"
+async def alerta_espera_job(context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         rows = conn.execute("""
             SELECT * FROM tickets
-            WHERE protocolo LIKE ?
-               OR contrato LIKE ?
-               OR user_name LIKE ?
-               OR categoria LIKE ?
-               OR subcategoria LIKE ?
-            ORDER BY id DESC
-            LIMIT 10
-        """, (like, like, like, like, like)).fetchall()
-
-    if not rows:
-        await update.message.reply_text(f"🔎 Nenhum atendimento encontrado para: {termo}")
-        return
-
-    linhas = [f"🔎 *Resultado da busca:* `{termo}`", ""]
-    botoes = []
-    for r in rows:
-        sub = f" / {r['subcategoria']}" if r['subcategoria'] else ""
-        atendente = r['atendente_nome'] or "-"
-        espera = minutos(r['created_at']) if r['status'] == 'aguardando' else "-"
-        linhas.extend([
-            f"🎫 *{r['protocolo']}*",
-            f"👤 Técnico: {r['user_name']}",
-            f"📂 Fila: {r['categoria']}{sub}",
-            f"📄 Contrato: {r['contrato'] or '-'}",
-            f"📌 Status: {r['status']}",
-            f"👨‍💻 Atendente: {atendente}",
-            f"⏱️ Espera: {espera} min" if espera != '-' else "",
-            "",
-        ])
-        if r['status'] == 'aguardando':
-            botoes.append([InlineKeyboardButton(f"✅ Assumir {r['protocolo']}", callback_data=f"topico_assumir:{r['protocolo']}")])
-        elif r['status'] == 'em_atendimento':
-            botoes.append([InlineKeyboardButton(f"✅ Finalizar {r['protocolo']}", callback_data=f"topico_finalizar:{r['protocolo']}")])
-
-    await update.message.reply_text(
-        "\n".join([l for l in linhas if l != ""]),
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(botoes) if botoes else None,
-    )
-
-
-async def verificar_alertas_espera(context: ContextTypes.DEFAULT_TYPE):
-    """Envia alerta no grupo quando um chamado ficar aguardando além do limite."""
-    if not ATENDENTES_CHAT_ID:
-        return
-
-    with db() as conn:
-        rows = conn.execute("""
-            SELECT * FROM tickets
-            WHERE status='aguardando'
-              AND COALESCE(alerta_espera_enviado, 0)=0
+            WHERE status='aguardando' AND COALESCE(alertado_espera, 0)=0
             ORDER BY id ASC
-            LIMIT 20
         """).fetchall()
 
     for r in rows:
-        espera = minutos(r['created_at'])
-        if espera < ALERTA_ESPERA_MIN:
-            continue
-
-        sub = f" / {r['subcategoria']}" if r['subcategoria'] else ""
-        texto = (
-            f"🚨 *Alerta de espera*\n\n"
-            f"🎫 *{r['protocolo']}*\n"
-            f"👤 Técnico: *{r['user_name']}*\n"
-            f"📂 Fila: *{r['categoria']}{sub}*\n"
-            f"📄 Contrato: *{r['contrato'] or '-'}*\n"
-            f"⏱️ Aguardando há *{espera} min*"
-        )
-        teclado = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"✅ Assumir {r['protocolo']}", callback_data=f"topico_assumir:{r['protocolo']}")],
-            [InlineKeyboardButton("🔄 Atualizar painel", callback_data="atualizar_painel")],
-        ])
-
-        try:
-            await context.bot.send_message(
-                chat_id=ATENDENTES_CHAT_ID,
-                text=texto,
-                parse_mode="Markdown",
-                reply_markup=teclado,
-            )
-            atualizar_ticket(r['protocolo'], alerta_espera_enviado=1)
-        except Exception as e:
-            logger.warning("Erro ao enviar alerta de espera: %s", e)
+        espera = minutos(r["created_at"])
+        if espera >= ALERTA_ESPERA_MIN:
+            try:
+                await context.bot.send_message(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    text=(
+                        f"🚨 *Alerta de espera*\n\n"
+                        f"🎫 {r['protocolo']}\n"
+                        f"👤 Técnico: {r['user_name']}\n"
+                        f"📂 Fila: {r['categoria']}\n"
+                        f"⏱️ Aguardando há {espera} min"
+                    ),
+                    parse_mode="Markdown",
+                )
+                atualizar_ticket(r["protocolo"], alertado_espera=1)
+            except Exception as e:
+                logger.warning("Erro ao enviar alerta de espera: %s", e)
 
 
 def main():
@@ -1114,10 +1160,10 @@ def main():
     app.add_handler(CallbackQueryHandler(botoes))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, tratar_mensagem))
 
-    if app.job_queue:
-        app.job_queue.run_repeating(verificar_alertas_espera, interval=60, first=60)
-    else:
-        logger.warning("JobQueue não está disponível. Para alerta automático, use python-telegram-bot[job-queue].")
+    try:
+        app.job_queue.run_repeating(alerta_espera_job, interval=60, first=60)
+    except Exception as e:
+        logger.warning("Job queue não inicializada: %s", e)
 
     app.run_polling()
 
