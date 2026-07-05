@@ -9,6 +9,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    KeyboardButton,
 )
 from telegram.ext import (
     Application,
@@ -49,6 +50,13 @@ def db():
     return conn
 
 
+def add_column_if_missing(conn, table, column, ddl):
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    except sqlite3.OperationalError:
+        pass
+
+
 def init_db():
     with db() as conn:
         conn.execute("""
@@ -67,7 +75,11 @@ def init_db():
             assumed_at TEXT,
             closed_at TEXT,
             last_message_at TEXT,
-            message_thread_id INTEGER
+            message_thread_id INTEGER,
+            subcategoria TEXT,
+            latitude REAL,
+            longitude REAL,
+            historico_enviado INTEGER DEFAULT 0
         )
         """)
         conn.execute("""
@@ -79,13 +91,23 @@ def init_db():
             sender_role TEXT,
             message_type TEXT,
             text TEXT,
+            file_id TEXT,
+            latitude REAL,
+            longitude REAL,
             created_at TEXT
         )
         """)
-        try:
-            conn.execute("ALTER TABLE tickets ADD COLUMN message_thread_id INTEGER")
-        except sqlite3.OperationalError:
-            pass
+
+        # Migrações para bancos antigos
+        add_column_if_missing(conn, "tickets", "message_thread_id", "INTEGER")
+        add_column_if_missing(conn, "tickets", "subcategoria", "TEXT")
+        add_column_if_missing(conn, "tickets", "latitude", "REAL")
+        add_column_if_missing(conn, "tickets", "longitude", "REAL")
+        add_column_if_missing(conn, "tickets", "historico_enviado", "INTEGER DEFAULT 0")
+
+        add_column_if_missing(conn, "messages", "file_id", "TEXT")
+        add_column_if_missing(conn, "messages", "latitude", "REAL")
+        add_column_if_missing(conn, "messages", "longitude", "REAL")
 
 
 def now():
@@ -100,14 +122,14 @@ def minutos(dt_iso):
         return 0
 
 
-def criar_ticket_db(user_id, user_name, categoria, contrato=None):
+def criar_ticket_db(user_id, user_name, categoria, contrato=None, subcategoria=None):
     created = now()
     with db() as conn:
         cur = conn.execute("""
             INSERT INTO tickets
-            (user_id, user_name, categoria, contrato, status, created_at, last_message_at)
-            VALUES (?, ?, ?, ?, 'aguardando', ?, ?)
-        """, (user_id, user_name, categoria, contrato, created, created))
+            (user_id, user_name, categoria, contrato, subcategoria, status, created_at, last_message_at)
+            VALUES (?, ?, ?, ?, ?, 'aguardando', ?, ?)
+        """, (user_id, user_name, categoria, contrato, subcategoria, created, created))
         ticket_id = cur.lastrowid
         protocolo = f"COP-{ticket_id:04d}"
         conn.execute("UPDATE tickets SET protocolo=? WHERE id=?", (protocolo, ticket_id))
@@ -123,13 +145,24 @@ def atualizar_ticket(protocolo, **kwargs):
         conn.execute(f"UPDATE tickets SET {cols} WHERE protocolo=?", values)
 
 
-def registrar_msg(protocolo, sender_id, sender_name, sender_role, message_type, text=""):
+def registrar_msg(protocolo, sender_id, sender_name, sender_role, message_type, text="", file_id=None, latitude=None, longitude=None):
     with db() as conn:
         conn.execute("""
             INSERT INTO messages
-            (protocolo, sender_id, sender_name, sender_role, message_type, text, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (protocolo, sender_id, sender_name, sender_role, message_type, text or "", now()))
+            (protocolo, sender_id, sender_name, sender_role, message_type, text, file_id, latitude, longitude, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            protocolo,
+            sender_id,
+            sender_name,
+            sender_role,
+            message_type,
+            text or "",
+            file_id,
+            latitude,
+            longitude,
+            now(),
+        ))
         conn.execute("UPDATE tickets SET last_message_at=? WHERE protocolo=?", (now(), protocolo))
 
 
@@ -186,7 +219,8 @@ def painel_texto():
     if atendimento:
         for r in atendimento[:10]:
             atendente = r["atendente_nome"] or "Sem atendente"
-            linhas.append(f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']} - {atendente}")
+            sub = f" / {r['subcategoria']}" if r["subcategoria"] else ""
+            linhas.append(f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']}{sub} - {atendente}")
     else:
         linhas.append("Nenhum atendimento em andamento.")
 
@@ -195,7 +229,8 @@ def painel_texto():
     if aguardando:
         for r in aguardando[:20]:
             espera = minutos(r["created_at"])
-            linhas.append(f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']} - {espera} min")
+            sub = f" / {r['subcategoria']}" if r["subcategoria"] else ""
+            linhas.append(f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']}{sub} - {espera} min")
     else:
         linhas.append("Fila vazia no momento.")
 
@@ -263,6 +298,22 @@ def menu_principal():
     ])
 
 
+def menu_ativo():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤🚫 Cliente ausente", callback_data="ativo:Cliente ausente")],
+        [InlineKeyboardButton("📍❓ Endereço não localizado", callback_data="ativo:Endereço não localizado")],
+        [InlineKeyboardButton("📄 Outros", callback_data="ativo:Outros")],
+    ])
+
+
+def teclado_localizacao():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📍 Enviar localização", request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 async def criar_topico_do_chamado(context, protocolo, user_name, categoria):
     ticket = buscar_ticket(protocolo)
     if ticket and ticket.get("message_thread_id"):
@@ -283,6 +334,11 @@ async def enviar_cabecalho_topico(context, protocolo):
     if not ticket or not ticket.get("message_thread_id"):
         return
 
+    sub = f"\n📌 Motivo: *{ticket['subcategoria']}*" if ticket.get("subcategoria") else ""
+    loc = ""
+    if ticket.get("latitude") and ticket.get("longitude"):
+        loc = f"\n📍 Localização recebida."
+
     teclado = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Assumir {protocolo}", callback_data=f"topico_assumir:{protocolo}")],
         [InlineKeyboardButton(f"✅ Finalizar {protocolo}", callback_data=f"topico_finalizar:{protocolo}")],
@@ -295,8 +351,8 @@ async def enviar_cabecalho_topico(context, protocolo):
         text=(
             f"🎫 *{protocolo}*\n"
             f"👤 Técnico: *{ticket['user_name']}*\n"
-            f"📂 Fila: *{ticket['categoria']}*\n"
-            f"📄 Contrato: *{ticket.get('contrato') or '-'}*\n\n"
+            f"📂 Fila: *{ticket['categoria']}*{sub}\n"
+            f"📄 Contrato: *{ticket.get('contrato') or '-'}*{loc}\n\n"
             "Responda neste tópico para conversar com o técnico."
         ),
         parse_mode="Markdown",
@@ -311,6 +367,106 @@ async def enviar_cabecalho_topico(context, protocolo):
         )
     except Exception:
         pass
+
+
+async def reenviar_historico_para_topico(context, protocolo):
+    ticket = buscar_ticket(protocolo)
+    if not ticket or not ticket.get("message_thread_id"):
+        return
+
+    if ticket.get("historico_enviado"):
+        return
+
+    thread_id = ticket["message_thread_id"]
+
+    with db() as conn:
+        msgs = conn.execute("""
+            SELECT * FROM messages
+            WHERE protocolo=? AND sender_role='tecnico'
+            ORDER BY id ASC
+        """, (protocolo,)).fetchall()
+
+    if not msgs:
+        atualizar_ticket(protocolo, historico_enviado=1)
+        return
+
+    await context.bot.send_message(
+        chat_id=ATENDENTES_CHAT_ID,
+        message_thread_id=thread_id,
+        text="📎 *Histórico/evidências enviados pelo técnico:*",
+        parse_mode="Markdown",
+    )
+
+    for m in msgs:
+        try:
+            legenda = f"📩 {protocolo} - {m['sender_name']}"
+            if m["text"]:
+                legenda += f"\n\n{m['text']}"
+
+            if m["message_type"] == "text":
+                await context.bot.send_message(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    message_thread_id=thread_id,
+                    text=legenda,
+                )
+            elif m["message_type"] == "photo":
+                await context.bot.send_photo(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    message_thread_id=thread_id,
+                    photo=m["file_id"],
+                    caption=legenda,
+                )
+            elif m["message_type"] == "document":
+                await context.bot.send_document(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    message_thread_id=thread_id,
+                    document=m["file_id"],
+                    caption=legenda,
+                )
+            elif m["message_type"] == "video":
+                await context.bot.send_video(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    message_thread_id=thread_id,
+                    video=m["file_id"],
+                    caption=legenda,
+                )
+            elif m["message_type"] == "voice":
+                await context.bot.send_voice(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    message_thread_id=thread_id,
+                    voice=m["file_id"],
+                    caption=legenda,
+                )
+            elif m["message_type"] == "location":
+                await context.bot.send_location(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    message_thread_id=thread_id,
+                    latitude=m["latitude"],
+                    longitude=m["longitude"],
+                )
+                await context.bot.send_message(
+                    chat_id=ATENDENTES_CHAT_ID,
+                    message_thread_id=thread_id,
+                    text=legenda,
+                )
+        except Exception as e:
+            logger.warning("Falha ao reenviar item do histórico: %s", e)
+
+    atualizar_ticket(protocolo, historico_enviado=1)
+
+
+def tipo_mensagem(msg):
+    if msg.photo:
+        return "photo", msg.photo[-1].file_id, msg.caption or ""
+    if msg.document:
+        return "document", msg.document.file_id, msg.caption or ""
+    if msg.video:
+        return "video", msg.video.file_id, msg.caption or ""
+    if msg.voice:
+        return "voice", msg.voice.file_id, ""
+    if msg.location:
+        return "location", None, ""
+    return "text", None, msg.text or ""
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -345,7 +501,7 @@ async def enviar_menu_adm(context, chat_id):
 async def listar_aguardando_adm(query, context):
     with db() as conn:
         rows = conn.execute("""
-            SELECT protocolo, user_name, categoria, created_at
+            SELECT protocolo, user_name, categoria, subcategoria, created_at
             FROM tickets WHERE status='aguardando'
             ORDER BY id ASC LIMIT 30
         """).fetchall()
@@ -358,7 +514,8 @@ async def listar_aguardando_adm(query, context):
     texto = "📌 *Escolha o atendimento para assumir:*\n\n"
     for r in rows:
         espera = minutos(r["created_at"])
-        texto += f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']} - {espera} min\n"
+        sub = f" / {r['subcategoria']}" if r["subcategoria"] else ""
+        texto += f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']}{sub} - {espera} min\n"
         botoes.append([InlineKeyboardButton(
             f"Assumir {r['protocolo']} - {r['user_name']}",
             callback_data=f"adm_assumir:{r['protocolo']}"
@@ -395,7 +552,7 @@ async def listar_gestao_adm(query, context):
 async def assumir_proximo(query, context):
     with db() as conn:
         row = conn.execute("""
-            SELECT protocolo, user_name, categoria, message_thread_id
+            SELECT protocolo
             FROM tickets
             WHERE status='aguardando'
             ORDER BY id ASC
@@ -406,8 +563,7 @@ async def assumir_proximo(query, context):
         await query.message.reply_text("Nenhum chamado aguardando no momento.")
         return
 
-    protocolo = row["protocolo"]
-    await assumir_ticket(protocolo, query.from_user, context, query.message.chat_id)
+    await assumir_ticket(row["protocolo"], query.from_user, context, query.message.chat_id)
 
 
 async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
@@ -455,6 +611,8 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
         )
     except Exception:
         pass
+
+    await reenviar_historico_para_topico(context, protocolo)
 
     if ticket.get("message_thread_id"):
         await context.bot.send_message(
@@ -558,9 +716,26 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("categoria:"):
         categoria = data.split(":", 1)[1]
+
+        if categoria == "Ativo":
+            context.user_data["categoria"] = "Ativo"
+            await query.message.reply_text("📞 Escolha o motivo do Ativo:", reply_markup=menu_ativo())
+            return
+
         context.user_data["categoria"] = categoria
         context.user_data["etapa"] = "contrato"
         await query.message.reply_text("📄 Informe o número do contrato:")
+        return
+
+    if data.startswith("ativo:"):
+        subcategoria = data.split(":", 1)[1]
+        context.user_data["categoria"] = "Ativo"
+        context.user_data["subcategoria"] = subcategoria
+        context.user_data["etapa"] = "contrato"
+        await query.message.reply_text(
+            f"📞 Motivo selecionado: *{subcategoria}*\n\n📄 Informe o número do contrato:",
+            parse_mode="Markdown",
+        )
         return
 
     if data == "assumir_proximo":
@@ -657,12 +832,25 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Técnico informando contrato.
     if context.user_data.get("etapa") == "contrato":
         categoria = context.user_data.get("categoria", "Outros")
+        subcategoria = context.user_data.get("subcategoria")
         contrato = msg.text.strip() if msg.text else ""
-        protocolo = criar_ticket_db(user.id, user.full_name, categoria, contrato)
+
+        protocolo = criar_ticket_db(user.id, user.full_name, categoria, contrato, subcategoria)
         context.user_data["protocolo"] = protocolo
-        context.user_data["etapa"] = "fotos"
         usuarios_em_chamado[user.id] = protocolo
 
+        if categoria == "PSW":
+            context.user_data["etapa"] = "localizacao"
+            await msg.reply_text(
+                f"🎫 Protocolo: *{protocolo}*\n\n"
+                "📍 Agora envie a localização atual pelo botão abaixo.",
+                parse_mode="Markdown",
+                reply_markup=teclado_localizacao(),
+            )
+            await atualizar_painel(context)
+            return
+
+        context.user_data["etapa"] = "fotos"
         teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
 
         await msg.reply_text(
@@ -673,6 +861,42 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=teclado,
         )
         await atualizar_painel(context)
+        return
+
+    # PSW recebendo localização obrigatória
+    if context.user_data.get("etapa") == "localizacao":
+        protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
+        if not protocolo:
+            await msg.reply_text("Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        if msg.location:
+            atualizar_ticket(protocolo, latitude=msg.location.latitude, longitude=msg.location.longitude, last_message_at=now())
+            registrar_msg(
+                protocolo,
+                user.id,
+                user.full_name,
+                "tecnico",
+                "location",
+                "Localização enviada",
+                latitude=msg.location.latitude,
+                longitude=msg.location.longitude,
+            )
+
+            context.user_data["etapa"] = "fotos"
+            teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
+            await msg.reply_text(
+                "✅ Localização recebida.\n\n"
+                "📸 Agora envie as evidências/fotos necessárias.\n\n"
+                "Quando terminar, toque no botão abaixo:",
+                reply_markup=teclado,
+            )
+            return
+
+        await msg.reply_text(
+            "⚠️ Para PSW é obrigatório enviar a localização pelo botão abaixo.",
+            reply_markup=teclado_localizacao(),
+        )
         return
 
     # Técnico finalizando fotos.
@@ -693,7 +917,18 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Técnico enviando mensagem depois do chamado criado: vai para o tópico.
     ticket_tecnico = obter_ticket_ativo_usuario(user.id)
     if ticket_tecnico and ticket_tecnico.get("message_thread_id"):
-        registrar_msg(ticket_tecnico["protocolo"], user.id, user.full_name, "tecnico", "mensagem", msg.text or msg.caption or "")
+        msg_type, file_id, text = tipo_mensagem(msg)
+        registrar_msg(
+            ticket_tecnico["protocolo"],
+            user.id,
+            user.full_name,
+            "tecnico",
+            msg_type,
+            text,
+            file_id=file_id,
+            latitude=msg.location.latitude if msg.location else None,
+            longitude=msg.location.longitude if msg.location else None,
+        )
         await encaminhar_mensagem(
             msg,
             context,
@@ -703,14 +938,30 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Recebendo fotos antes de finalizar.
+    # Recebendo fotos/evidências antes de finalizar.
     if context.user_data.get("etapa") == "fotos":
         protocolo = context.user_data.get("protocolo")
-        if msg.photo or msg.document or msg.video or msg.location:
+        if msg.photo or msg.document or msg.video or msg.location or msg.voice or msg.text:
             ticket = buscar_ticket(protocolo)
-            fotos = (ticket.get("fotos") or 0) + 1
+            msg_type, file_id, text = tipo_mensagem(msg)
+
+            if msg_type in ["photo", "document", "video", "location"]:
+                fotos = (ticket.get("fotos") or 0) + 1
+            else:
+                fotos = ticket.get("fotos") or 0
+
             atualizar_ticket(protocolo, fotos=fotos, last_message_at=now())
-            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "foto", msg.caption or "")
+            registrar_msg(
+                protocolo,
+                user.id,
+                user.full_name,
+                "tecnico",
+                msg_type,
+                text,
+                file_id=file_id,
+                latitude=msg.location.latitude if msg.location else None,
+                longitude=msg.location.longitude if msg.location else None,
+            )
 
             teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
             await msg.reply_text(
