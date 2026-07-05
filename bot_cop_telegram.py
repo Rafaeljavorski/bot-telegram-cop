@@ -1,18 +1,16 @@
 import os
+import sqlite3
 import logging
 from datetime import datetime
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Any, Optional
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,624 +20,468 @@ from telegram.ext import (
     filters,
 )
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 ATENDENTES_CHAT_ID = int(os.getenv("ATENDENTES_CHAT_ID", "0"))
+DATABASE_PATH = os.getenv("DATABASE_PATH", "cop_bot.db")
 
-if not TOKEN:
-    raise RuntimeError("Variavel TELEGRAM_BOT_TOKEN nao configurada no Railway")
-if not ATENDENTES_CHAT_ID:
-    raise RuntimeError("Variavel ATENDENTES_CHAT_ID nao configurada no Railway")
+if not BOT_TOKEN:
+    raise RuntimeError("Configure a variável TELEGRAM_BOT_TOKEN no Railway.")
 
-@dataclass
-class Chamado:
-    id: int
-    protocolo: str
-    user_id: int
-    nome: str
-    username: str
-    fila: str
-    contrato: Optional[str] = None
-    localizacao: Optional[str] = None
-    resumo: Optional[str] = None
-    fotos: List[str] = field(default_factory=list)
-    status: str = "aguardando"  # aguardando | em_atendimento | finalizado
-    atendente_id: Optional[int] = None
-    atendente_nome: Optional[str] = None
-    criado_em: str = field(default_factory=lambda: datetime.now().strftime("%d/%m/%Y %H:%M"))
-    assumido_em: Optional[str] = None
-
-chamados: Dict[int, Chamado] = {}
-fila_aguardando: List[int] = []
-em_atendimento: List[int] = []
-user_chamado_aberto: Dict[int, int] = {}             # técnico/cliente -> chamado aberto
-atendente_chamados: Dict[int, List[int]] = {}         # atendente -> vários chamados
-atendente_chamado_selecionado: Dict[int, int] = {}    # atendente -> chamado atual para responder
-user_etapa: Dict[int, str] = {}
-painel_msg_id: Optional[int] = None
-proximo_id = 1
-
-MENU_PRINCIPAL = InlineKeyboardMarkup([
-    [InlineKeyboardButton("✅ PSW", callback_data="menu:PSW"), InlineKeyboardButton("📍 NAP", callback_data="menu:NAP")],
-    [InlineKeyboardButton("📞 Ativo", callback_data="menu:Ativo"), InlineKeyboardButton("📶 Atenuação", callback_data="menu:Atenuação")],
-    [InlineKeyboardButton("📄 Outros", callback_data="menu:Outros")],
-])
-
-PAINEL_BOTOES = InlineKeyboardMarkup([
-    [InlineKeyboardButton("✅ Assumir próximo", callback_data="fila:assumir_proximo")],
-    [InlineKeyboardButton("📋 Meus atendimentos", callback_data="fila:meus")],
-    [InlineKeyboardButton("🔄 Atualizar fila", callback_data="fila:atualizar")],
-])
-
-FINALIZAR_FOTOS_BOTAO = InlineKeyboardMarkup([
-    [InlineKeyboardButton("✅ Finalizar fotos", callback_data="fotos:finalizar")]
-])
-
-# Botão grande no teclado do Telegram (mais fácil para o técnico do que digitar)
-FINALIZAR_FOTOS_TECLADO = ReplyKeyboardMarkup(
-    [[KeyboardButton("✅ Finalizar fotos")]],
-    resize_keyboard=True,
-    one_time_keyboard=False,
-)
+fila_aguardando = []
+em_atendimento = {}
+usuarios_em_chamado = {}
+atendentes_ativos = {}
+painel_message_id = None
 
 
-def protocolo(cid: int) -> str:
-    return f"COP-{cid:04d}"
+def db():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def nome_usuario(update: Update) -> str:
-    u = update.effective_user
-    return u.full_name or u.first_name or "Técnico"
+def init_db():
+    with db() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            protocolo TEXT UNIQUE,
+            user_id INTEGER,
+            user_name TEXT,
+            categoria TEXT,
+            contrato TEXT,
+            status TEXT,
+            atendente_id INTEGER,
+            atendente_nome TEXT,
+            fotos INTEGER DEFAULT 0,
+            created_at TEXT,
+            assumed_at TEXT,
+            closed_at TEXT,
+            last_message_at TEXT
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            protocolo TEXT,
+            sender_id INTEGER,
+            sender_name TEXT,
+            sender_role TEXT,
+            message_type TEXT,
+            text TEXT,
+            created_at TEXT
+        )
+        """)
 
 
-def username_usuario(update: Update) -> str:
-    u = update.effective_user
-    return f"@{u.username}" if u and u.username else "sem username"
+def now():
+    return datetime.now().isoformat(timespec="seconds")
 
 
-def meus_atendimentos_keyboard(atendente_id: int) -> InlineKeyboardMarkup:
-    linhas = []
-    ids = atendente_chamados.get(atendente_id, [])
-    for cid in ids:
-        c = chamados.get(cid)
-        if c and c.status == "em_atendimento":
-            marcador = "✅" if atendente_chamado_selecionado.get(atendente_id) == cid else "💬"
-            linhas.append([InlineKeyboardButton(f"{marcador} {c.protocolo} - {c.nome} - {c.fila}", callback_data=f"atendente:selecionar:{cid}")])
-    linhas.append([InlineKeyboardButton("🔄 Atualizar", callback_data="fila:meus")])
-    return InlineKeyboardMarkup(linhas)
+def criar_ticket_db(user_id, user_name, categoria, contrato=None):
+    created = now()
+    with db() as conn:
+        cur = conn.execute("""
+            INSERT INTO tickets
+            (user_id, user_name, categoria, contrato, status, created_at, last_message_at)
+            VALUES (?, ?, ?, ?, 'aguardando', ?, ?)
+        """, (user_id, user_name, categoria, contrato, created, created))
+        ticket_id = cur.lastrowid
+        protocolo = f"COP-{ticket_id:04d}"
+        conn.execute("UPDATE tickets SET protocolo=? WHERE id=?", (protocolo, ticket_id))
+    return protocolo
 
 
-def resumo_chamado(c: Chamado) -> str:
-    return (
-        f"🎫 *{c.protocolo}*\n"
-        f"📋 Fila: *{c.fila}*\n"
-        f"👤 Técnico: *{c.nome}* {c.username}\n"
-        f"📄 Contrato: {c.contrato or 'não informado'}\n"
-        f"📍 Localização: {c.localizacao or 'não enviada'}\n"
-        f"📝 Resumo: {c.resumo or 'sem resumo'}\n"
-        f"🕒 Criado: {c.criado_em}"
-    )
+def atualizar_ticket(protocolo, **kwargs):
+    if not kwargs:
+        return
+    cols = ", ".join([f"{k}=?" for k in kwargs])
+    values = list(kwargs.values()) + [protocolo]
+    with db() as conn:
+        conn.execute(f"UPDATE tickets SET {cols} WHERE protocolo=?", values)
 
 
-def montar_texto_painel() -> str:
-    texto = [
-        "📋 *FILA COP - ATENDIMENTOS*",
+def registrar_msg(protocolo, sender_id, sender_name, sender_role, message_type, text=""):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO messages
+            (protocolo, sender_id, sender_name, sender_role, message_type, text, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (protocolo, sender_id, sender_name, sender_role, message_type, text or "", now()))
+        conn.execute("UPDATE tickets SET last_message_at=? WHERE protocolo=?", (now(), protocolo))
+
+
+def buscar_ticket(protocolo):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM tickets WHERE protocolo=?", (protocolo,)).fetchone()
+        return dict(row) if row else None
+
+
+def obter_ticket_ativo_usuario(user_id):
+    with db() as conn:
+        row = conn.execute("""
+            SELECT * FROM tickets
+            WHERE user_id=? AND status IN ('aguardando','em_atendimento')
+            ORDER BY id DESC LIMIT 1
+        """, (user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def obter_ticket_ativo_atendente(atendente_id):
+    protocolo = atendentes_ativos.get(atendente_id)
+    if protocolo:
+        return buscar_ticket(protocolo)
+    with db() as conn:
+        row = conn.execute("""
+            SELECT * FROM tickets
+            WHERE atendente_id=? AND status='em_atendimento'
+            ORDER BY assumed_at DESC LIMIT 1
+        """, (atendente_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def painel_texto():
+    with db() as conn:
+        aguardando = conn.execute("SELECT COUNT(*) c FROM tickets WHERE status='aguardando'").fetchone()["c"]
+        atendimento = conn.execute("SELECT COUNT(*) c FROM tickets WHERE status='em_atendimento'").fetchone()["c"]
+        finalizados = conn.execute("""
+            SELECT COUNT(*) c FROM tickets
+            WHERE status='finalizado' AND date(closed_at)=date('now','localtime')
+        """).fetchone()["c"]
+        ultimos = conn.execute("""
+            SELECT protocolo, user_name, categoria, status, atendente_nome, created_at
+            FROM tickets
+            WHERE status IN ('aguardando','em_atendimento')
+            ORDER BY id ASC LIMIT 15
+        """).fetchall()
+
+    linhas = [
+        "📋 *PAINEL COP - ATENDIMENTOS*",
         "",
-        f"🟡 Aguardando: *{len(fila_aguardando)}*",
-        f"🟢 Em atendimento: *{len(em_atendimento)}*",
+        f"🟡 Aguardando: *{aguardando}*",
+        f"🟢 Em atendimento: *{atendimento}*",
+        f"✅ Finalizados hoje: *{finalizados}*",
         "",
-        "🟢 *EM ATENDIMENTO*",
+        "*Fila atual:*",
     ]
-
-    if em_atendimento:
-        for pos, cid in enumerate(em_atendimento[-15:], start=1):
-            c = chamados[cid]
-            texto.append(f"{pos}. *{c.protocolo}* — {c.nome} — {c.fila} — 👤 {c.atendente_nome or 'Atendente'}")
+    if not ultimos:
+        linhas.append("Nenhum chamado aguardando.")
     else:
-        texto.append("Nenhum atendimento em andamento.")
-
-    texto += ["", "🟡 *AGUARDANDO*"]
-    if fila_aguardando:
-        for pos, cid in enumerate(fila_aguardando[:25], start=1):
-            c = chamados[cid]
-            texto.append(f"{pos}. *{c.protocolo}* — {c.nome} — {c.fila} — {c.criado_em}")
-        if len(fila_aguardando) > 25:
-            texto.append(f"... e mais {len(fila_aguardando) - 25} aguardando.")
-    else:
-        texto.append("Fila vazia no momento.")
-
-    texto += ["", f"🕒 Atualizado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"]
-    return "\n".join(texto)
-
-
-def botoes_atendente(chamado_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Responder este chamado", callback_data=f"atendente:selecionar:{chamado_id}")],
-        [InlineKeyboardButton("📋 Meus atendimentos", callback_data="fila:meus")],
-        [InlineKeyboardButton("✅ Finalizar atendimento", callback_data=f"chamado:finalizar:{chamado_id}")],
-    ])
+        for r in ultimos:
+            emoji = "🟡" if r["status"] == "aguardando" else "🟢"
+            atend = f" - {r['atendente_nome']}" if r["atendente_nome"] else ""
+            linhas.append(f"{emoji} {r['protocolo']} - {r['user_name']} - {r['categoria']}{atend}")
+    return "\n".join(linhas)
 
 
 async def atualizar_painel(context: ContextTypes.DEFAULT_TYPE):
-    global painel_msg_id
-    texto = montar_texto_painel()
+    global painel_message_id
+    if not ATENDENTES_CHAT_ID:
+        return
+
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Assumir próximo", callback_data="assumir_proximo")],
+        [InlineKeyboardButton("📋 Meus atendimentos", callback_data="meus_atendimentos")],
+        [InlineKeyboardButton("🔄 Atualizar painel", callback_data="atualizar_painel")],
+    ])
+
     try:
-        if painel_msg_id:
+        if painel_message_id:
             await context.bot.edit_message_text(
                 chat_id=ATENDENTES_CHAT_ID,
-                message_id=painel_msg_id,
-                text=texto,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=PAINEL_BOTOES,
+                message_id=painel_message_id,
+                text=painel_texto(),
+                parse_mode="Markdown",
+                reply_markup=teclado,
             )
         else:
             msg = await context.bot.send_message(
                 chat_id=ATENDENTES_CHAT_ID,
-                text=texto,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=PAINEL_BOTOES,
+                text=painel_texto(),
+                parse_mode="Markdown",
+                reply_markup=teclado,
             )
-            painel_msg_id = msg.message_id
+            painel_message_id = msg.message_id
     except Exception as e:
-        logger.warning("Falha ao atualizar painel, criando novo. Erro: %s", e)
+        logger.warning("Erro ao atualizar painel: %s", e)
         msg = await context.bot.send_message(
             chat_id=ATENDENTES_CHAT_ID,
-            text=texto,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=PAINEL_BOTOES,
+            text=painel_texto(),
+            parse_mode="Markdown",
+            reply_markup=teclado,
         )
-        painel_msg_id = msg.message_id
+        painel_message_id = msg.message_id
+
+
+def menu_principal():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ PSW", callback_data="categoria:PSW")],
+        [InlineKeyboardButton("📍 NAP", callback_data="categoria:NAP")],
+        [InlineKeyboardButton("📞 Ativo", callback_data="categoria:Ativo")],
+        [InlineKeyboardButton("📶 Atenuação", callback_data="categoria:Atenuacao")],
+        [InlineKeyboardButton("📄 Outros", callback_data="categoria:Outros")],
+    ])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     await update.message.reply_text(
-        "👋 Olá! Seja bem-vindo(a) à Central de Atendimento COP CIP Telecom.\n\nEscolha uma opção abaixo:",
-        reply_markup=MENU_PRINCIPAL,
+        "👋 Bem-vindo ao COP CIP Telecom.\n\nEscolha uma opção:",
+        reply_markup=menu_principal(),
     )
-
-
-async def painel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await atualizar_painel(context)
-    await update.message.reply_text("✅ Painel da fila atualizado no grupo de atendentes.")
 
 
 async def meus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    atendente_id = update.effective_user.id
-    ids = [cid for cid in atendente_chamados.get(atendente_id, []) if chamados.get(cid) and chamados[cid].status == "em_atendimento"]
-    atendente_chamados[atendente_id] = ids
-    if not ids:
-        await update.message.reply_text("📋 Você não possui atendimentos em andamento.")
+    await enviar_meus_atendimentos(update.effective_user.id, context, update.effective_chat.id)
+
+
+async def enviar_meus_atendimentos(atendente_id, context, chat_id):
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT protocolo, user_name, categoria
+            FROM tickets
+            WHERE atendente_id=? AND status='em_atendimento'
+            ORDER BY assumed_at DESC
+        """, (atendente_id,)).fetchall()
+
+    if not rows:
+        await context.bot.send_message(chat_id=chat_id, text="Você não possui atendimentos em aberto.")
         return
-    await update.message.reply_text(
-        "📋 *Seus atendimentos*\n\nToque no atendimento que deseja responder. Depois disso, tudo que você enviar aqui irá para o técnico selecionado.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=meus_atendimentos_keyboard(atendente_id),
-    )
+
+    botoes = []
+    texto = "📋 *Meus atendimentos:*\n\n"
+    for r in rows:
+        texto += f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']}\n"
+        botoes.append([InlineKeyboardButton(f"Responder {r['protocolo']}", callback_data=f"responder:{r['protocolo']}")])
+    await context.bot.send_message(chat_id=chat_id, text=texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(botoes))
 
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    fila = query.data.split(":", 1)[1]
+    data = query.data
+    user = query.from_user
 
-    context.user_data.clear()
-    context.user_data["fila"] = fila
-    user_etapa[query.from_user.id] = "contrato"
-
-    await query.message.reply_text(
-        f"📄 Você selecionou: *{fila}*\n\nInforme o número do contrato:",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def receber_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Se for conversa após chamado assumido, faz ponte técnico <-> atendente
-    if await encaminhar_conversa(update, context):
+    if data.startswith("categoria:"):
+        categoria = data.split(":", 1)[1]
+        context.user_data["categoria"] = categoria
+        context.user_data["etapa"] = "contrato"
+        await query.message.reply_text("📄 Informe o número do contrato:")
         return
 
-    user_id = update.effective_user.id
-    etapa = user_etapa.get(user_id)
-
-    if not etapa:
-        await update.message.reply_text("Use /start para iniciar um novo atendimento.")
+    if data == "assumir_proximo":
+        await assumir_proximo(query, context)
         return
 
-    if etapa == "contrato":
-        context.user_data["contrato"] = update.message.text.strip()
-        user_etapa[user_id] = "localizacao"
-        botao_local = ReplyKeyboardMarkup(
-            [[KeyboardButton("📍 Enviar localização", request_location=True)]],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        )
-        await update.message.reply_text("📍 Agora envie sua localização atual pelo botão abaixo.", reply_markup=botao_local)
-        return
-
-    if etapa == "resumo":
-        context.user_data["resumo"] = update.message.text.strip()
-        await criar_chamado(update, context)
-        return
-
-    await update.message.reply_text("Continue seguindo as instruções do atendimento.")
-
-
-async def receber_localizacao(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await encaminhar_conversa(update, context):
-        return
-
-    user_id = update.effective_user.id
-    loc = update.message.location
-    context.user_data["localizacao"] = f"https://maps.google.com/?q={loc.latitude},{loc.longitude}"
-
-    fila = context.user_data.get("fila", "Outros")
-    if fila in ["PSW", "Ativo", "Atenuação"]:
-        user_etapa[user_id] = "fotos"
-        await update.message.reply_text(
-            "📸 Envie as evidências/fotos necessárias.\n\nQuando terminar, toque no botão *✅ Finalizar fotos* abaixo.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=FINALIZAR_FOTOS_TECLADO,
-        )
-    elif fila == "NAP":
-        user_etapa[user_id] = "resumo"
-        await update.message.reply_text(
-            "📍 Informe a localização da NAP, número da NAP ou detalhe da solicitação:",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-    else:
-        user_etapa[user_id] = "resumo"
-        await update.message.reply_text("📄 Resuma sua solicitação em poucas palavras:", reply_markup=ReplyKeyboardRemove())
-
-
-async def receber_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Se já estiver em atendimento, foto vira conversa e vai para o outro lado
-    if await encaminhar_conversa(update, context):
-        return
-
-    user_id = update.effective_user.id
-    if user_etapa.get(user_id) != "fotos":
-        return
-
-    foto = update.message.photo[-1]
-    context.user_data.setdefault("fotos", []).append(foto.file_id)
-    total = len(context.user_data.get("fotos", []))
-    await update.message.reply_text(
-        f"✅ Foto recebida. Total: {total}\n\nEnvie mais fotos ou toque no botão *✅ Finalizar fotos* abaixo.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=FINALIZAR_FOTOS_TECLADO,
-    )
-
-
-async def fotos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if user_etapa.get(user_id) != "fotos":
-        await query.message.reply_text("Use /start para iniciar um atendimento.")
-        return
-    # cria chamado usando dados do botão (query não tem message do técnico como Update normal com effective_user sim)
-    await criar_chamado(update, context, origem_query=True)
-
-
-async def finalizar_fotos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_etapa.get(user_id) != "fotos":
-        await update.message.reply_text("Use /start para iniciar um atendimento.")
-        return
-    await criar_chamado(update, context)
-
-
-async def criar_chamado(update: Update, context: ContextTypes.DEFAULT_TYPE, origem_query: bool = False):
-    global proximo_id
-    user_id = update.effective_user.id
-
-    if user_id in user_chamado_aberto:
-        chamado_existente = chamados.get(user_chamado_aberto[user_id])
-        if chamado_existente and chamado_existente.status != "finalizado":
-            texto = f"⚠️ Você já possui um chamado aberto: *{chamado_existente.protocolo}*\nAguarde o atendimento ou peça para finalizarem."
-            if origem_query:
-                await update.callback_query.message.reply_text(texto, parse_mode=ParseMode.MARKDOWN)
-            else:
-                await update.message.reply_text(texto, parse_mode=ParseMode.MARKDOWN)
-            return
-
-    cid = proximo_id
-    proximo_id += 1
-
-    chamado = Chamado(
-        id=cid,
-        protocolo=protocolo(cid),
-        user_id=user_id,
-        nome=nome_usuario(update),
-        username=username_usuario(update),
-        fila=context.user_data.get("fila", "Outros"),
-        contrato=context.user_data.get("contrato"),
-        localizacao=context.user_data.get("localizacao"),
-        resumo=context.user_data.get("resumo"),
-        fotos=context.user_data.get("fotos", []),
-    )
-
-    chamados[cid] = chamado
-    fila_aguardando.append(cid)
-    user_chamado_aberto[user_id] = cid
-    user_etapa.pop(user_id, None)
-    context.user_data.clear()
-
-    texto = (
-        f"✅ Seu chamado entrou na fila.\n\n"
-        f"🎫 Protocolo: *{chamado.protocolo}*\n"
-        f"📋 Fila: {chamado.fila}\n\n"
-        "Aguarde, um atendente irá assumir seu atendimento."
-    )
-    if origem_query:
-        await update.callback_query.message.reply_text(texto, parse_mode=ParseMode.MARKDOWN, reply_markup=ReplyKeyboardRemove())
-    else:
-        await update.message.reply_text(texto, parse_mode=ParseMode.MARKDOWN, reply_markup=ReplyKeyboardRemove())
-    await atualizar_painel(context)
-
-
-async def fila_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    acao = query.data.split(":", 1)[1]
-
-    if acao == "atualizar":
+    if data == "atualizar_painel":
         await atualizar_painel(context)
         return
 
-    if acao == "meus":
-        ids = [cid for cid in atendente_chamados.get(query.from_user.id, []) if chamados.get(cid) and chamados[cid].status == "em_atendimento"]
-        atendente_chamados[query.from_user.id] = ids
-        if not ids:
-            await query.message.reply_text("📋 Você não possui atendimentos em andamento.")
+    if data == "meus_atendimentos":
+        await enviar_meus_atendimentos(user.id, context, user.id)
+        return
+
+    if data.startswith("responder:"):
+        protocolo = data.split(":", 1)[1]
+        ticket = buscar_ticket(protocolo)
+        if not ticket or ticket["status"] != "em_atendimento" or ticket["atendente_id"] != user.id:
+            await query.message.reply_text("Esse atendimento não está disponível para você.")
             return
+        atendentes_ativos[user.id] = protocolo
         await query.message.reply_text(
-            "📋 *Seus atendimentos*\n\nToque no atendimento que deseja responder. O atendimento marcado com ✅ é o selecionado no momento.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=meus_atendimentos_keyboard(query.from_user.id),
+            f"✍️ Modo resposta ativado para *{protocolo}* - {ticket['user_name']}.\n\n"
+            "Agora tudo que você enviar aqui irá para esse técnico.\nUse /meus para trocar de atendimento.",
+            parse_mode="Markdown",
         )
         return
 
-    if acao == "assumir_proximo":
-        if not fila_aguardando:
-            await query.answer("Não há chamados aguardando.", show_alert=True)
+    if data.startswith("finalizar:"):
+        protocolo = data.split(":", 1)[1]
+        await finalizar_chamado(protocolo, user, context, query.message.chat_id)
+        return
+
+
+async def assumir_proximo(query, context):
+    user = query.from_user
+    with db() as conn:
+        row = conn.execute("""
+            SELECT * FROM tickets WHERE status='aguardando'
+            ORDER BY id ASC LIMIT 1
+        """).fetchone()
+        if not row:
+            await query.message.reply_text("Nenhum chamado aguardando no momento.")
             return
-        cid = fila_aguardando[0]
-        await assumir_chamado(cid, query, context)
+        ticket = dict(row)
+        conn.execute("""
+            UPDATE tickets
+            SET status='em_atendimento', atendente_id=?, atendente_nome=?, assumed_at=?, last_message_at=?
+            WHERE protocolo=?
+        """, (user.id, user.full_name, now(), now(), ticket["protocolo"]))
 
+    protocolo = ticket["protocolo"]
+    atendentes_ativos[user.id] = protocolo
+    em_atendimento[protocolo] = user.id
 
-async def atendente_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    _, acao, cid_txt = query.data.split(":")
-    cid = int(cid_txt)
-    c = chamados.get(cid)
-    if not c or c.status != "em_atendimento":
-        await query.message.reply_text("⚠️ Esse atendimento não está mais em andamento.")
-        return
-    if c.atendente_id != query.from_user.id:
-        await query.answer("Esse atendimento não é seu.", show_alert=True)
-        return
-
-    if acao == "selecionar":
-        atendente_chamado_selecionado[query.from_user.id] = cid
-        await query.message.reply_text(
-            f"💬 Atendimento selecionado para resposta:\n\n{resumo_chamado(c)}\n\nAgora tudo que você enviar aqui no privado irá para este técnico.\n\nPara trocar, use /meus.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=botoes_atendente(cid),
-        )
-
-
-async def chamado_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    _, acao, cid_txt = query.data.split(":")
-    cid = int(cid_txt)
-    if acao == "finalizar":
-        await finalizar_chamado(cid, query, context)
-
-
-async def assumir_chamado(cid: int, query, context: ContextTypes.DEFAULT_TYPE):
-    chamado = chamados.get(cid)
-    if not chamado:
-        await query.answer("Chamado não encontrado.", show_alert=True)
-        return
-    if chamado.status != "aguardando":
-        await query.answer("Esse chamado já foi assumido ou finalizado.", show_alert=True)
-        return
-
-    chamado.status = "em_atendimento"
-    chamado.atendente_id = query.from_user.id
-    chamado.atendente_nome = query.from_user.full_name
-    chamado.assumido_em = datetime.now().strftime("%d/%m/%Y %H:%M")
-
-    if cid in fila_aguardando:
-        fila_aguardando.remove(cid)
-    if cid not in em_atendimento:
-        em_atendimento.append(cid)
-
-    atendente_chamados.setdefault(chamado.atendente_id, [])
-    if cid not in atendente_chamados[chamado.atendente_id]:
-        atendente_chamados[chamado.atendente_id].append(cid)
-    atendente_chamado_selecionado[chamado.atendente_id] = cid
+    teclado_atendente = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Responder {protocolo}", callback_data=f"responder:{protocolo}")],
+        [InlineKeyboardButton(f"✅ Finalizar {protocolo}", callback_data=f"finalizar:{protocolo}")],
+    ])
 
     try:
         await context.bot.send_message(
-            chat_id=chamado.user_id,
+            chat_id=user.id,
             text=(
-                "🔷 *CIP Telecom*\n\n"
-                f"Seu atendimento *{chamado.protocolo}* foi iniciado por:\n"
-                f"👤 *{chamado.atendente_nome}*\n\n"
-                "A partir de agora, envie suas mensagens aqui mesmo. O COP receberá e responderá por este chat."
+                f"✅ Você assumiu um atendimento.\n\n"
+                f"🎫 *{protocolo}*\n"
+                f"👤 Técnico: *{ticket['user_name']}*\n"
+                f"📂 Fila: *{ticket['categoria']}*\n\n"
+                "Envie sua resposta aqui no privado do bot."
             ),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode="Markdown",
+            reply_markup=teclado_atendente,
         )
-    except Exception as e:
-        logger.warning("Nao consegui avisar usuario %s: %s", chamado.user_id, e)
-
-    try:
-        await context.bot.send_message(
-            chat_id=chamado.atendente_id,
-            text=(
-                "✅ *Você assumiu um atendimento*\n\n"
-                f"{resumo_chamado(chamado)}\n\n"
-                "💬 Este atendimento já ficou selecionado para resposta.\n"
-                "Tudo que você enviar aqui no privado será enviado para este técnico.\n\n"
-                "Se você assumir mais atendimentos, use /meus para escolher qual deseja responder."
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=botoes_atendente(chamado.id),
+    except Exception:
+        await query.message.reply_text(
+            "⚠️ O atendente precisa abrir o bot no privado e enviar /start para receber mensagens privadas."
         )
-    except Exception as e:
-        logger.warning("Nao consegui enviar privado ao atendente %s: %s", chamado.atendente_id, e)
-        await query.answer("Você assumiu, mas abra o bot no privado e clique em /start para receber e responder.", show_alert=True)
-
-    for file_id in chamado.fotos[:10]:
-        try:
-            await context.bot.send_photo(chat_id=chamado.atendente_id, photo=file_id, caption=f"📸 Evidência — {chamado.protocolo}")
-        except Exception as e:
-            logger.warning("Falha ao enviar foto ao atendente: %s", e)
-
-    await atualizar_painel(context)
-
-
-async def finalizar_chamado(cid: int, query, context: ContextTypes.DEFAULT_TYPE):
-    chamado = chamados.get(cid)
-    if not chamado:
-        await query.answer("Chamado não encontrado.", show_alert=True)
-        return
-    if chamado.status == "finalizado":
-        await query.answer("Esse chamado já foi finalizado.", show_alert=True)
-        return
-    if chamado.atendente_id and chamado.atendente_id != query.from_user.id:
-        await query.answer("Somente o atendente que assumiu pode finalizar.", show_alert=True)
-        return
-
-    chamado.status = "finalizado"
-    if cid in fila_aguardando:
-        fila_aguardando.remove(cid)
-    if cid in em_atendimento:
-        em_atendimento.remove(cid)
-    user_chamado_aberto.pop(chamado.user_id, None)
-    if chamado.atendente_id:
-        if chamado.atendente_id in atendente_chamados:
-            atendente_chamados[chamado.atendente_id] = [x for x in atendente_chamados[chamado.atendente_id] if x != cid]
-        if atendente_chamado_selecionado.get(chamado.atendente_id) == cid:
-            restantes = [x for x in atendente_chamados.get(chamado.atendente_id, []) if chamados.get(x) and chamados[x].status == "em_atendimento"]
-            if restantes:
-                atendente_chamado_selecionado[chamado.atendente_id] = restantes[-1]
-            else:
-                atendente_chamado_selecionado.pop(chamado.atendente_id, None)
 
     await context.bot.send_message(
-        chat_id=chamado.user_id,
-        text=(
-            "✅ *Atendimento finalizado*\n\n"
-            f"Chamado *{chamado.protocolo}* finalizado por: *{query.from_user.full_name}*\n"
-            "Obrigado por entrar em contato com o COP CIP Telecom."
-        ),
-        parse_mode=ParseMode.MARKDOWN,
+        chat_id=ticket["user_id"],
+        text=f"🔷 CIP Telecom\n\nSeu atendimento foi iniciado por: *{user.full_name}*\n🎫 Protocolo: *{protocolo}*",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
     )
-    try:
-        await context.bot.send_message(chat_id=query.from_user.id, text=f"✅ Atendimento {chamado.protocolo} finalizado com sucesso.")
-    except Exception:
-        pass
     await atualizar_painel(context)
 
 
-async def encaminhar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Faz a ponte privado técnico <-> privado atendente durante atendimento."""
-    if not update.effective_chat or update.effective_chat.type != "private":
-        return False
+async def finalizar_chamado(protocolo, user, context, chat_id):
+    ticket = buscar_ticket(protocolo)
+    if not ticket:
+        await context.bot.send_message(chat_id=chat_id, text="Chamado não encontrado.")
+        return
+    if ticket["atendente_id"] != user.id:
+        await context.bot.send_message(chat_id=chat_id, text="Você não é o atendente responsável por esse chamado.")
+        return
 
-    remetente_id = update.effective_user.id
-    cid = None
-    destino_id = None
-    prefixo = None
-
-    # Técnico/cliente mandando para o COP
-    cid_user = user_chamado_aberto.get(remetente_id)
-    if cid_user:
-        c = chamados.get(cid_user)
-        if c and c.status == "em_atendimento" and c.atendente_id:
-            cid = cid_user
-            destino_id = c.atendente_id
-            prefixo = f"💬 *Técnico {c.nome}* — *{c.protocolo}*:"
-            # quando técnico envia algo, seleciona esse chamado para o atendente responder mais rápido
-            atendente_chamado_selecionado[c.atendente_id] = cid
-
-    # Atendente mandando para técnico: precisa haver atendimento selecionado
-    if not destino_id:
-        cid_att = atendente_chamado_selecionado.get(remetente_id)
-        c = chamados.get(cid_att) if cid_att else None
-        if c and c.status == "em_atendimento" and c.atendente_id == remetente_id:
-            cid = cid_att
-            destino_id = c.user_id
-            prefixo = f"💬 *COP {c.atendente_nome or 'Atendente'}* — *{c.protocolo}*:"
-        elif remetente_id in atendente_chamados and atendente_chamados.get(remetente_id):
-            await update.message.reply_text(
-                "⚠️ Você possui mais de um atendimento. Use /meus e selecione qual atendimento deseja responder antes de enviar a mensagem."
-            )
-            return True
-
-    if not destino_id or not cid:
-        return False
-
-    msg = update.message
+    atualizar_ticket(protocolo, status="finalizado", closed_at=now())
+    atendentes_ativos.pop(user.id, None)
     try:
-        if msg.text and not msg.text.startswith("/"):
-            await context.bot.send_message(chat_id=destino_id, text=f"{prefixo}\n\n{msg.text}", parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(chat_id=ticket["user_id"], text=f"✅ Atendimento {protocolo} finalizado pelo COP.")
+    except Exception:
+        pass
+    await context.bot.send_message(chat_id=chat_id, text=f"✅ Atendimento {protocolo} finalizado.")
+    await atualizar_painel(context)
+
+
+async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+
+    # Técnico preenchendo abertura
+    if context.user_data.get("etapa") == "contrato":
+        categoria = context.user_data.get("categoria", "Outros")
+        contrato = msg.text.strip() if msg.text else ""
+        protocolo = criar_ticket_db(user.id, user.full_name, categoria, contrato)
+        context.user_data["protocolo"] = protocolo
+        context.user_data["etapa"] = "fotos"
+        usuarios_em_chamado[user.id] = protocolo
+
+        teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
+
+        await msg.reply_text(
+            f"🎫 Protocolo: *{protocolo}*\n\n"
+            "📸 Envie as evidências/fotos necessárias.\n\n"
+            "Quando terminar, toque no botão abaixo:",
+            parse_mode="Markdown",
+            reply_markup=teclado,
+        )
+        await atualizar_painel(context)
+        return
+
+    # Finalizar fotos via botão
+    if msg.text and msg.text.strip().lower() in ["✅ finalizar fotos", "finalizar fotos"]:
+        protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
+        if not protocolo:
+            await msg.reply_text("Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+        registrar_msg(protocolo, user.id, user.full_name, "tecnico", "finalizou_fotos", "Finalizou fotos")
+        await msg.reply_text(
+            f"✅ Fotos recebidas.\n🎫 {protocolo}\n\nSeu atendimento entrou na fila do COP.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await atualizar_painel(context)
+        return
+
+    # Técnico ou atendente em conversa
+    ticket_tecnico = obter_ticket_ativo_usuario(user.id)
+    ticket_atendente = obter_ticket_ativo_atendente(user.id)
+
+    if ticket_tecnico and ticket_tecnico["status"] == "em_atendimento":
+        protocolo = ticket_tecnico["protocolo"]
+        destino = ticket_tecnico["atendente_id"]
+        registrar_msg(protocolo, user.id, user.full_name, "tecnico", "mensagem", msg.text or msg.caption or "")
+        await encaminhar_mensagem(msg, context, destino, f"📩 {protocolo} - {user.full_name}")
+        return
+
+    if ticket_atendente and ticket_atendente["status"] == "em_atendimento":
+        protocolo = ticket_atendente["protocolo"]
+        destino = ticket_atendente["user_id"]
+        registrar_msg(protocolo, user.id, user.full_name, "atendente", "mensagem", msg.text or msg.caption or "")
+        await encaminhar_mensagem(msg, context, destino, f"📩 {protocolo} - COP {user.full_name}")
+        return
+
+    # Recebendo fotos antes de finalizar
+    if context.user_data.get("etapa") == "fotos":
+        protocolo = context.user_data.get("protocolo")
+        if msg.photo or msg.document or msg.video:
+            ticket = buscar_ticket(protocolo)
+            fotos = (ticket.get("fotos") or 0) + 1
+            atualizar_ticket(protocolo, fotos=fotos, last_message_at=now())
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "foto", msg.caption or "")
+            teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
+            await msg.reply_text(
+                f"✅ Foto recebida. Total: {fotos}\n\nToque em *✅ Finalizar fotos* quando terminar.",
+                parse_mode="Markdown",
+                reply_markup=teclado,
+            )
+            return
+
+    await msg.reply_text("Use /start para iniciar um novo atendimento.")
+
+
+async def encaminhar_mensagem(msg, context, destino, cabecalho):
+    try:
+        if msg.text:
+            await context.bot.send_message(chat_id=destino, text=f"{cabecalho}\n\n{msg.text}")
         elif msg.photo:
-            await context.bot.send_photo(chat_id=destino_id, photo=msg.photo[-1].file_id, caption=prefixo, parse_mode=ParseMode.MARKDOWN)
+            await context.bot.send_photo(chat_id=destino, photo=msg.photo[-1].file_id, caption=f"{cabecalho}\n\n{msg.caption or ''}")
         elif msg.document:
-            await context.bot.send_document(chat_id=destino_id, document=msg.document.file_id, caption=prefixo, parse_mode=ParseMode.MARKDOWN)
+            await context.bot.send_document(chat_id=destino, document=msg.document.file_id, caption=f"{cabecalho}\n\n{msg.caption or ''}")
         elif msg.video:
-            await context.bot.send_video(chat_id=destino_id, video=msg.video.file_id, caption=prefixo, parse_mode=ParseMode.MARKDOWN)
-        elif msg.audio:
-            await context.bot.send_audio(chat_id=destino_id, audio=msg.audio.file_id, caption=prefixo, parse_mode=ParseMode.MARKDOWN)
+            await context.bot.send_video(chat_id=destino, video=msg.video.file_id, caption=f"{cabecalho}\n\n{msg.caption or ''}")
         elif msg.voice:
-            await context.bot.send_voice(chat_id=destino_id, voice=msg.voice.file_id, caption=prefixo, parse_mode=ParseMode.MARKDOWN)
+            await context.bot.send_voice(chat_id=destino, voice=msg.voice.file_id, caption=cabecalho)
         elif msg.location:
-            await context.bot.send_message(chat_id=destino_id, text=prefixo, parse_mode=ParseMode.MARKDOWN)
-            await context.bot.send_location(chat_id=destino_id, latitude=msg.location.latitude, longitude=msg.location.longitude)
+            await context.bot.send_location(chat_id=destino, latitude=msg.location.latitude, longitude=msg.location.longitude)
+            await context.bot.send_message(chat_id=destino, text=cabecalho)
         else:
-            await context.bot.copy_message(chat_id=destino_id, from_chat_id=msg.chat_id, message_id=msg.message_id)
-        return True
+            await msg.forward(chat_id=destino)
     except Exception as e:
-        logger.warning("Falha ao encaminhar conversa do chamado %s: %s", cid, e)
-        await msg.reply_text("⚠️ Não consegui enviar essa mensagem. Verifique se a outra pessoa iniciou o bot no privado.")
-        return True
-
-
-async def erro_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Erro no bot:", exc_info=context.error)
+        logger.exception("Erro ao encaminhar mensagem: %s", e)
+        await msg.reply_text("Não consegui encaminhar a mensagem. Verifique se a outra pessoa iniciou o bot no privado.")
 
 
 def main():
-    app = Application.builder().token(TOKEN).build()
-
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("painel", painel))
     app.add_handler(CommandHandler("meus", meus))
-    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
-    app.add_handler(CallbackQueryHandler(fila_callback, pattern=r"^fila:"))
-    app.add_handler(CallbackQueryHandler(atendente_callback, pattern=r"^atendente:"))
-    app.add_handler(CallbackQueryHandler(chamado_callback, pattern=r"^chamado:"))
-    app.add_handler(CallbackQueryHandler(fotos_callback, pattern=r"^fotos:finalizar$"))
-    app.add_handler(MessageHandler(filters.LOCATION, receber_localizacao))
-    app.add_handler(MessageHandler(filters.PHOTO, receber_foto))
-    # Mantém compatibilidade: se alguém digitar, também funciona
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^(✅\s*)?finalizar fotos$"), finalizar_fotos))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receber_texto))
-    app.add_handler(MessageHandler((filters.Document.ALL | filters.VIDEO | filters.VOICE | filters.AUDIO) & ~filters.COMMAND, encaminhar_conversa))
-    app.add_error_handler(erro_handler)
-
-    logger.info("Bot COP iniciado com protocolos, seleção de atendimento e botão finalizar fotos")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_handler(CallbackQueryHandler(botoes))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, tratar_mensagem))
+    app.run_polling()
 
 
 if __name__ == "__main__":
