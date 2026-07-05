@@ -1,6 +1,6 @@
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 import logging
 from datetime import datetime
 
@@ -63,7 +63,7 @@ class CursorResult:
 
 class DBWrapper:
     def __init__(self):
-        self.conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
     def __enter__(self):
         return self
