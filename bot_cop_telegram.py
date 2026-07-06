@@ -703,8 +703,8 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
         return
 
     if ticket["status"] == "finalizado":
-        if chat_id:
-            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {protocolo} já foi finalizado.")
+        # Evita poluir o tópico fechado quando alguém clica novamente no botão antigo.
+        # O callback já foi respondido pelo Telegram; aqui apenas ignora silenciosamente.
         return
 
     if not admin and ticket.get("atendente_id") and ticket["atendente_id"] != user.id:

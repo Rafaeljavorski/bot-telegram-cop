@@ -1,10 +1,9 @@
-# Bot COP - sem mensagens de fixação
+# Bot COP - sem aviso repetido em tópico finalizado
 
-Correções:
-- Remove o pin automático do painel e do cabeçalho do tópico.
-- Evita mensagens automáticas "COP CIP Telecom fixou..." no grupo.
-- Ignora mensagens de serviço do Telegram, para não responder "Use /start" no grupo.
-- Mantém travas de Assumir/Finalizar e PostgreSQL.
+Correção:
+- Se alguém clicar novamente no botão Finalizar de um tópico já finalizado, o bot ignora silenciosamente.
+- Não envia mais mensagens repetidas como "COP-0006 já foi finalizado".
+- Mantém as demais correções: sem mensagens de fixação, travas de assumir/finalizar e PostgreSQL.
 
 Substitua no GitHub:
 - bot_cop_telegram.py
