@@ -358,6 +358,14 @@ def menu_ativo():
     ])
 
 
+def menu_nap():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Localização da NAP", callback_data="nap:Localização da NAP")],
+        [InlineKeyboardButton("📡 NAP mais próxima", callback_data="nap:NAP mais próxima")],
+        [InlineKeyboardButton("🆔 ID da NAP", callback_data="nap:ID da NAP")],
+    ])
+
+
 def teclado_localizacao():
     return ReplyKeyboardMarkup(
         [[KeyboardButton("📍 Enviar localização", request_location=True)]],
@@ -834,6 +842,11 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("📞 Escolha o motivo do Ativo:", reply_markup=menu_ativo())
             return
 
+        if categoria == "NAP":
+            context.user_data["categoria"] = "NAP"
+            await query.message.reply_text("📍 Escolha uma opção de NAP:", reply_markup=menu_nap())
+            return
+
         context.user_data["categoria"] = categoria
         context.user_data["etapa"] = "contrato"
         await query.message.reply_text("📄 Informe o número do contrato:")
@@ -846,6 +859,17 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["etapa"] = "contrato"
         await query.message.reply_text(
             f"📞 Motivo selecionado: *{subcategoria}*\n\n📄 Informe o número do contrato:",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("nap:"):
+        subcategoria = data.split(":", 1)[1]
+        context.user_data["categoria"] = "NAP"
+        context.user_data["subcategoria"] = subcategoria
+        context.user_data["etapa"] = "contrato"
+        await query.message.reply_text(
+            f"📍 Opção selecionada: *{subcategoria}*\n\n📄 Informe o número do contrato:",
             parse_mode="Markdown",
         )
         return
@@ -978,6 +1002,18 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await atualizar_painel(context)
             return
 
+        if categoria == "NAP" and subcategoria in ["NAP mais próxima", "ID da NAP"]:
+            context.user_data["etapa"] = "localizacao_nap_sem_foto"
+            await msg.reply_text(
+                f"🎫 Protocolo: *{protocolo}*\n\n"
+                f"📍 Para *{subcategoria}*, envie a localização pelo botão abaixo.\n\n"
+                "Não precisa enviar fotos nessa opção.",
+                parse_mode="Markdown",
+                reply_markup=teclado_localizacao(),
+            )
+            await atualizar_painel(context)
+            return
+
         context.user_data["etapa"] = "fotos"
         teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
 
@@ -989,6 +1025,52 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=teclado,
         )
         await atualizar_painel(context)
+        return
+
+    # NAP mais próxima / ID da NAP: localização obrigatória e não precisa de fotos.
+    if context.user_data.get("etapa") == "localizacao_nap_sem_foto":
+        protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
+        if not protocolo:
+            context.user_data.clear()
+            await msg.reply_text("Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        ticket = buscar_ticket(protocolo)
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text(
+                "Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        if msg.location:
+            atualizar_ticket(protocolo, latitude=msg.location.latitude, longitude=msg.location.longitude, last_message_at=now())
+            registrar_msg(
+                protocolo,
+                user.id,
+                user.full_name,
+                "tecnico",
+                "location",
+                "Localização enviada",
+                latitude=msg.location.latitude,
+                longitude=msg.location.longitude,
+            )
+
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "finalizou_fotos", "Finalizado sem fotos - opção NAP")
+            await msg.reply_text(
+                f"✅ Localização recebida.\n🎫 {protocolo}\n\nSeu atendimento entrou na fila do COP.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data["etapa"] = "aguardando_cop"
+            await atualizar_painel(context)
+            return
+
+        await msg.reply_text(
+            "⚠️ Para essa opção de NAP é obrigatório enviar a localização pelo botão abaixo.",
+            reply_markup=teclado_localizacao(),
+        )
         return
 
     # PSW recebendo localização obrigatória.

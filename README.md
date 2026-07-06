@@ -1,10 +1,14 @@
-# Bot COP - sem aviso repetido em tópico finalizado
+# Bot COP - fluxo NAP atualizado
 
-Correção:
-- Se alguém clicar novamente no botão Finalizar de um tópico já finalizado, o bot ignora silenciosamente.
-- Não envia mais mensagens repetidas como "COP-0006 já foi finalizado".
-- Mantém as demais correções: sem mensagens de fixação, travas de assumir/finalizar e PostgreSQL.
-
-Substitua no GitHub:
-- bot_cop_telegram.py
-- requirements.txt
+Alterações:
+- Ao clicar em NAP, aparecem 3 opções:
+  - Localização da NAP
+  - NAP mais próxima
+  - ID da NAP
+- Se escolher NAP mais próxima ou ID da NAP:
+  - solicita contrato;
+  - depois solicita localização;
+  - não pede fotos;
+  - envia direto para a fila após receber localização.
+- Localização da NAP segue fluxo normal com evidências/fotos.
+- Mantém PostgreSQL e demais correções.
