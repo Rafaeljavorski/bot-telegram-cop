@@ -35,6 +35,16 @@ ADM_IDS = [
     if x.strip()
 ]
 
+# TESTE: tópicos separados por atendente.
+# Eduardo assume no grupo principal e recebe o tópico no grupo EDUARDO BOT.
+COP_GROUPS = {
+    8176848972: -1005562485186,  # Eduardo
+}
+
+SUPERVISOR_GROUP_ID = -1005133624770
+SUPERVISOR_IDS = [8342651270]
+
+
 if not BOT_TOKEN:
     raise RuntimeError("Configure a variável TELEGRAM_BOT_TOKEN no Railway.")
 
@@ -128,7 +138,9 @@ def init_db():
                 latitude DOUBLE PRECISION,
                 longitude DOUBLE PRECISION,
                 historico_enviado INTEGER DEFAULT 0,
-                alertado_espera INTEGER DEFAULT 0
+                alertado_espera INTEGER DEFAULT 0,
+                grupo_atendente BIGINT,
+                supervisor_thread_id BIGINT
             )
             """)
             cur.execute("""
@@ -154,6 +166,8 @@ def init_db():
         add_column_if_missing(conn, "tickets", "longitude", "DOUBLE PRECISION")
         add_column_if_missing(conn, "tickets", "historico_enviado", "INTEGER DEFAULT 0")
         add_column_if_missing(conn, "tickets", "alertado_espera", "INTEGER DEFAULT 0")
+        add_column_if_missing(conn, "tickets", "grupo_atendente", "BIGINT")
+        add_column_if_missing(conn, "tickets", "supervisor_thread_id", "BIGINT")
 
         add_column_if_missing(conn, "messages", "file_id", "TEXT")
         add_column_if_missing(conn, "messages", "latitude", "DOUBLE PRECISION")
@@ -223,9 +237,30 @@ def buscar_ticket(protocolo):
         return dict(row) if row else None
 
 
-def buscar_ticket_por_thread(thread_id):
+def buscar_ticket_por_thread(thread_id, chat_id=None):
     if not thread_id:
         return None
+
+    if chat_id is not None:
+        with db() as conn:
+            row = conn.execute("""
+                SELECT * FROM tickets
+                WHERE message_thread_id=%s
+                  AND grupo_atendente=%s
+                  AND status IN ('aguardando','em_atendimento')
+                ORDER BY id DESC LIMIT 1
+            """, (thread_id, chat_id)).fetchone()
+            if row:
+                return dict(row)
+
+            row = conn.execute("""
+                SELECT * FROM tickets
+                WHERE supervisor_thread_id=%s
+                  AND status IN ('aguardando','em_atendimento')
+                ORDER BY id DESC LIMIT 1
+            """, (thread_id,)).fetchone()
+            return dict(row) if row else None
+
     with db() as conn:
         row = conn.execute("""
             SELECT * FROM tickets
@@ -381,18 +416,42 @@ def teclado_localizacao():
     )
 
 
-async def criar_topico_do_chamado(context, protocolo, user_name, categoria):
+def grupo_do_atendente(atendente_id):
+    return COP_GROUPS.get(atendente_id)
+
+
+def destino_ticket(ticket):
+    return ticket.get("grupo_atendente") or ATENDENTES_CHAT_ID
+
+
+async def criar_topico_supervisor(context, protocolo, ticket):
+    if not SUPERVISOR_GROUP_ID:
+        return None
+    if ticket.get("supervisor_thread_id"):
+        return ticket["supervisor_thread_id"]
+
+    titulo = f"{protocolo} - {ticket['user_name'][:18]} - {ticket['categoria']}"
+    topico = await context.bot.create_forum_topic(
+        chat_id=SUPERVISOR_GROUP_ID,
+        name=titulo[:128],
+    )
+    atualizar_ticket(protocolo, supervisor_thread_id=topico.message_thread_id)
+    return topico.message_thread_id
+
+
+async def criar_topico_do_chamado(context, protocolo, user_name, categoria, grupo_destino=None):
     ticket = buscar_ticket(protocolo)
-    if ticket and ticket.get("message_thread_id"):
+    if ticket and ticket.get("message_thread_id") and ticket.get("grupo_atendente"):
         return ticket["message_thread_id"]
 
+    grupo = grupo_destino or (ticket.get("grupo_atendente") if ticket else None) or ATENDENTES_CHAT_ID
     titulo = f"{protocolo} - {user_name[:18]} - {categoria}"
     topico = await context.bot.create_forum_topic(
-        chat_id=ATENDENTES_CHAT_ID,
+        chat_id=grupo,
         name=titulo[:128],
     )
     thread_id = topico.message_thread_id
-    atualizar_ticket(protocolo, message_thread_id=thread_id)
+    atualizar_ticket(protocolo, message_thread_id=thread_id, grupo_atendente=grupo)
     return thread_id
 
 
@@ -413,7 +472,7 @@ async def enviar_cabecalho_topico(context, protocolo):
     ])
 
     msg = await context.bot.send_message(
-        chat_id=ATENDENTES_CHAT_ID,
+        chat_id=destino_ticket(ticket),
         message_thread_id=ticket["message_thread_id"],
         text=(
             f"🎫 *{protocolo}*\n"
@@ -449,7 +508,7 @@ async def reenviar_historico_para_topico(context, protocolo):
         return
 
     await context.bot.send_message(
-        chat_id=ATENDENTES_CHAT_ID,
+        chat_id=destino_ticket(ticket),
         message_thread_id=thread_id,
         text="📎 *Histórico/evidências enviados pelo técnico:*",
         parse_mode="Markdown",
@@ -462,23 +521,23 @@ async def reenviar_historico_para_topico(context, protocolo):
                 legenda += f"\n\n{m['text']}"
 
             if m["message_type"] == "text":
-                await context.bot.send_message(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, text=legenda)
+                await context.bot.send_message(chat_id=destino_ticket(ticket), message_thread_id=thread_id, text=legenda)
             elif m["message_type"] == "photo":
-                await context.bot.send_photo(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, photo=m["file_id"], caption=legenda)
+                await context.bot.send_photo(chat_id=destino_ticket(ticket), message_thread_id=thread_id, photo=m["file_id"], caption=legenda)
             elif m["message_type"] == "document":
-                await context.bot.send_document(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, document=m["file_id"], caption=legenda)
+                await context.bot.send_document(chat_id=destino_ticket(ticket), message_thread_id=thread_id, document=m["file_id"], caption=legenda)
             elif m["message_type"] == "video":
-                await context.bot.send_video(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, video=m["file_id"], caption=legenda)
+                await context.bot.send_video(chat_id=destino_ticket(ticket), message_thread_id=thread_id, video=m["file_id"], caption=legenda)
             elif m["message_type"] == "voice":
-                await context.bot.send_voice(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, voice=m["file_id"], caption=legenda)
+                await context.bot.send_voice(chat_id=destino_ticket(ticket), message_thread_id=thread_id, voice=m["file_id"], caption=legenda)
             elif m["message_type"] == "location":
                 await context.bot.send_location(
-                    chat_id=ATENDENTES_CHAT_ID,
+                    chat_id=destino_ticket(ticket),
                     message_thread_id=thread_id,
                     latitude=m["latitude"],
                     longitude=m["longitude"],
                 )
-                await context.bot.send_message(chat_id=ATENDENTES_CHAT_ID, message_thread_id=thread_id, text=legenda)
+                await context.bot.send_message(chat_id=destino_ticket(ticket), message_thread_id=thread_id, text=legenda)
         except Exception as e:
             logger.warning("Falha ao reenviar item do histórico: %s", e)
 
@@ -619,6 +678,31 @@ async def listar_gestao_adm(query, context):
     await query.message.reply_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(botoes))
 
 
+async def enviar_copia_supervisor(context, protocolo, texto=None, msg=None):
+    ticket = buscar_ticket(protocolo)
+    if not ticket or not SUPERVISOR_GROUP_ID or not ticket.get("supervisor_thread_id"):
+        return
+    try:
+        if msg:
+            await encaminhar_mensagem(
+                msg,
+                context,
+                SUPERVISOR_GROUP_ID,
+                f"📩 {protocolo} - Cópia Supervisor",
+                thread_id=ticket["supervisor_thread_id"],
+                responder_erro=False,
+            )
+        elif texto:
+            await context.bot.send_message(
+                chat_id=SUPERVISOR_GROUP_ID,
+                message_thread_id=ticket["supervisor_thread_id"],
+                text=texto,
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.warning("Falha ao enviar cópia para supervisor: %s", e)
+
+
 async def assumir_proximo(query, context):
     with db() as conn:
         row = conn.execute("""
@@ -657,16 +741,27 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
             )
         return
 
-    if not ticket.get("message_thread_id"):
+    grupo_destino = grupo_do_atendente(user.id)
+    if not grupo_destino:
+        if origem_chat_id:
+            await context.bot.send_message(
+                chat_id=origem_chat_id,
+                text="⚠️ Você ainda não possui um grupo individual configurado para receber atendimentos."
+            )
+        return
+
+    if not ticket.get("message_thread_id") or ticket.get("grupo_atendente") != grupo_destino:
         try:
-            await criar_topico_do_chamado(context, protocolo, ticket["user_name"], ticket["categoria"])
+            await criar_topico_do_chamado(context, protocolo, ticket["user_name"], ticket["categoria"], grupo_destino=grupo_destino)
+            ticket = buscar_ticket(protocolo)
             await enviar_cabecalho_topico(context, protocolo)
+            await criar_topico_supervisor(context, protocolo, ticket)
         except Exception as e:
             logger.exception("Erro ao criar tópico ao assumir: %s", e)
             if origem_chat_id:
                 await context.bot.send_message(
                     chat_id=origem_chat_id,
-                    text="⚠️ Não consegui criar o tópico. Verifique se o bot é admin e pode gerenciar tópicos."
+                    text="⚠️ Não consegui criar o tópico no grupo individual. Verifique se o bot é admin e pode gerenciar tópicos."
                 )
             return
 
@@ -677,6 +772,7 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
         atendente_nome=user.full_name,
         assumed_at=now(),
         last_message_at=now(),
+        grupo_atendente=grupo_destino,
     )
 
     ticket = buscar_ticket(protocolo)
@@ -692,23 +788,30 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
         pass
 
     await reenviar_historico_para_topico(context, protocolo)
+    await enviar_copia_supervisor(context, protocolo, "📎 *Histórico/evidências enviados ao atendente.*")
 
-    if ticket.get("message_thread_id"):
-        teclado = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"✅ Finalizar {protocolo}", callback_data=f"topico_finalizar:{protocolo}")],
-            [InlineKeyboardButton("🔄 Devolver para fila", callback_data=f"adm_devolver:{protocolo}")],
-        ])
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Finalizar {protocolo}", callback_data=f"topico_finalizar:{protocolo}")],
+        [InlineKeyboardButton("🔄 Devolver para fila", callback_data=f"adm_devolver:{protocolo}")],
+    ])
 
+    await context.bot.send_message(
+        chat_id=grupo_destino,
+        message_thread_id=ticket["message_thread_id"],
+        text=f"✅ Atendimento assumido por *{user.full_name}*.",
+        parse_mode="Markdown",
+        reply_markup=teclado,
+    )
+
+    if ticket.get("supervisor_thread_id"):
         await context.bot.send_message(
-            chat_id=ATENDENTES_CHAT_ID,
-            message_thread_id=ticket["message_thread_id"],
+            chat_id=SUPERVISOR_GROUP_ID,
+            message_thread_id=ticket["supervisor_thread_id"],
             text=f"✅ Atendimento assumido por *{user.full_name}*.",
             parse_mode="Markdown",
-            reply_markup=teclado,
         )
 
     await atualizar_painel(context)
-
 
 async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
     ticket = buscar_ticket(protocolo)
@@ -745,7 +848,7 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
     if ticket.get("message_thread_id"):
         try:
             await context.bot.edit_forum_topic(
-                chat_id=ATENDENTES_CHAT_ID,
+                chat_id=destino_ticket(ticket),
                 message_thread_id=ticket["message_thread_id"],
                 name=f"{protocolo} - FINALIZADO",
             )
@@ -755,7 +858,7 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
         # Fecha primeiro para a mensagem automática do Telegram não ficar por último.
         try:
             await context.bot.close_forum_topic(
-                chat_id=ATENDENTES_CHAT_ID,
+                chat_id=destino_ticket(ticket),
                 message_thread_id=ticket["message_thread_id"],
             )
         except Exception:
@@ -772,7 +875,7 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
 
         try:
             await context.bot.send_message(
-                chat_id=ATENDENTES_CHAT_ID,
+                chat_id=destino_ticket(ticket),
                 message_thread_id=ticket["message_thread_id"],
                 text=final_text,
                 parse_mode="Markdown",
@@ -781,22 +884,37 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
         except Exception:
             try:
                 await context.bot.reopen_forum_topic(
-                    chat_id=ATENDENTES_CHAT_ID,
+                    chat_id=destino_ticket(ticket),
                     message_thread_id=ticket["message_thread_id"],
                 )
                 await context.bot.send_message(
-                    chat_id=ATENDENTES_CHAT_ID,
+                    chat_id=destino_ticket(ticket),
                     message_thread_id=ticket["message_thread_id"],
                     text=final_text,
                     parse_mode="Markdown",
                     reply_markup=None,
                 )
                 await context.bot.close_forum_topic(
-                    chat_id=ATENDENTES_CHAT_ID,
+                    chat_id=destino_ticket(ticket),
                     message_thread_id=ticket["message_thread_id"],
                 )
             except Exception:
                 pass
+
+    if ticket.get("supervisor_thread_id"):
+        try:
+            await context.bot.send_message(
+                chat_id=SUPERVISOR_GROUP_ID,
+                message_thread_id=ticket["supervisor_thread_id"],
+                text=final_text if 'final_text' in locals() else f"✅ Atendimento {protocolo} finalizado por {user.full_name}.",
+                parse_mode="Markdown",
+            )
+            await context.bot.close_forum_topic(
+                chat_id=SUPERVISOR_GROUP_ID,
+                message_thread_id=ticket["supervisor_thread_id"],
+            )
+        except Exception:
+            pass
 
     await atualizar_painel(context)
 
@@ -827,10 +945,20 @@ async def devolver_ticket(protocolo, user, context, chat_id=None):
 
     if ticket.get("message_thread_id"):
         await context.bot.send_message(
-            chat_id=ATENDENTES_CHAT_ID,
+            chat_id=destino_ticket(ticket),
             message_thread_id=ticket["message_thread_id"],
             text=f"🔄 Atendimento devolvido para a fila por {user.full_name}.",
         )
+
+    if ticket.get("supervisor_thread_id"):
+        try:
+            await context.bot.send_message(
+                chat_id=SUPERVISOR_GROUP_ID,
+                message_thread_id=ticket["supervisor_thread_id"],
+                text=f"🔄 Atendimento devolvido para a fila por {user.full_name}.",
+            )
+        except Exception:
+            pass
 
     await atualizar_painel(context)
 
@@ -977,9 +1105,11 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         usuarios_em_chamado.pop(user.id, None)
 
-    # Mensagem enviada dentro de um tópico do grupo: vai para o técnico correto.
-    if update.effective_chat and update.effective_chat.id == ATENDENTES_CHAT_ID and msg.message_thread_id:
-        ticket = buscar_ticket_por_thread(msg.message_thread_id)
+    # Mensagem enviada dentro de um tópico do grupo individual do atendente: vai para o técnico correto.
+    chat_id_atual = update.effective_chat.id if update.effective_chat else None
+    grupos_atendimento = set(COP_GROUPS.values())
+    if chat_id_atual in grupos_atendimento and msg.message_thread_id:
+        ticket = buscar_ticket_por_thread(msg.message_thread_id, chat_id_atual)
         if ticket and ticket["status"] in ["aguardando", "em_atendimento"]:
             if msg.text and msg.text.startswith("/"):
                 return
@@ -1004,7 +1134,12 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             registrar_msg(ticket["protocolo"], user.id, user.full_name, "atendente", "mensagem", msg.text or msg.caption or "")
             await encaminhar_mensagem(msg, context, ticket["user_id"], f"📩 {ticket['protocolo']} - COP {user.full_name}")
+            await enviar_copia_supervisor(context, ticket["protocolo"], msg=msg)
             await atualizar_painel(context)
+        return
+
+    if chat_id_atual == SUPERVISOR_GROUP_ID and msg.message_thread_id:
+        # Grupo Supervisor é apenas acompanhamento nesse teste.
         return
 
     # Técnico informando contrato.
@@ -1417,10 +1552,11 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await encaminhar_mensagem(
                 msg,
                 context,
-                ATENDENTES_CHAT_ID,
+                destino_ticket(ticket),
                 f"📩 {ticket['protocolo']} - {user.full_name}",
                 thread_id=ticket["message_thread_id"],
             )
+            await enviar_copia_supervisor(context, ticket["protocolo"], msg=msg)
         else:
             await msg.reply_text(f"✅ Informação adicionada ao chamado {ticket['protocolo']}.")
 
@@ -1444,10 +1580,11 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await encaminhar_mensagem(
             msg,
             context,
-            ATENDENTES_CHAT_ID,
+            destino_ticket(ticket_tecnico),
             f"📩 {ticket_tecnico['protocolo']} - {user.full_name}",
             thread_id=ticket_tecnico["message_thread_id"],
         )
+        await enviar_copia_supervisor(context, ticket_tecnico["protocolo"], msg=msg)
         return
 
     # Recebendo fotos/evidências antes de finalizar.
@@ -1495,7 +1632,7 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("Use /start para iniciar um novo atendimento.")
 
 
-async def encaminhar_mensagem(msg, context, destino, cabecalho, thread_id=None):
+async def encaminhar_mensagem(msg, context, destino, cabecalho, thread_id=None, responder_erro=True):
     kwargs = {"chat_id": destino}
     if thread_id:
         kwargs["message_thread_id"] = thread_id
@@ -1518,10 +1655,11 @@ async def encaminhar_mensagem(msg, context, destino, cabecalho, thread_id=None):
             await msg.forward(chat_id=destino)
     except Exception as e:
         logger.exception("Erro ao encaminhar mensagem: %s", e)
-        try:
-            await msg.reply_text("Não consegui encaminhar a mensagem.")
-        except Exception:
-            pass
+        if responder_erro:
+            try:
+                await msg.reply_text("Não consegui encaminhar a mensagem.")
+            except Exception:
+                pass
 
 
 async def alerta_espera_job(context: ContextTypes.DEFAULT_TYPE):
