@@ -366,6 +366,13 @@ def menu_nap():
     ])
 
 
+def menu_atenuacao():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔢 Numeração da NAP", callback_data="atenuacao:Numeração da NAP")],
+        [InlineKeyboardButton("📍 Localização da NAP", callback_data="atenuacao:Localização da NAP")],
+    ])
+
+
 def teclado_localizacao():
     return ReplyKeyboardMarkup(
         [[KeyboardButton("📍 Enviar localização", request_location=True)]],
@@ -847,6 +854,14 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("📍 Escolha uma opção de NAP:", reply_markup=menu_nap())
             return
 
+        if categoria == "Atenuacao":
+            context.user_data["categoria"] = "Atenuacao"
+            await query.message.reply_text(
+                "📶 Para atenuação, escolha como deseja informar a NAP:",
+                reply_markup=menu_atenuacao()
+            )
+            return
+
         context.user_data["categoria"] = categoria
         context.user_data["etapa"] = "contrato"
         await query.message.reply_text("📄 Informe o número do contrato:")
@@ -870,6 +885,17 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["etapa"] = "contrato"
         await query.message.reply_text(
             f"📍 Opção selecionada: *{subcategoria}*\n\n📄 Informe o número do contrato:",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("atenuacao:"):
+        subcategoria = data.split(":", 1)[1]
+        context.user_data["categoria"] = "Atenuacao"
+        context.user_data["subcategoria"] = subcategoria
+        context.user_data["etapa"] = "contrato"
+        await query.message.reply_text(
+            f"📶 Opção selecionada: *{subcategoria}*\n\n📄 Informe o número do contrato:",
             parse_mode="Markdown",
         )
         return
@@ -1014,6 +1040,61 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await atualizar_painel(context)
             return
 
+        if categoria == "Ativo" and subcategoria == "Cliente ausente":
+            context.user_data["etapa"] = "ativo_cliente_ausente_localizacao"
+            await msg.reply_text(
+                f"🎫 Protocolo: *{protocolo}*\n\n"
+                "📍 Envie a localização do endereço pelo botão abaixo.\n\n"
+                "Depois será solicitada a *foto da fachada*.",
+                parse_mode="Markdown",
+                reply_markup=teclado_localizacao(),
+            )
+            await atualizar_painel(context)
+            return
+
+        if categoria == "Ativo" and subcategoria == "Endereço não localizado":
+            context.user_data["etapa"] = "ativo_endereco_nao_localizado_localizacao"
+            await msg.reply_text(
+                f"🎫 Protocolo: *{protocolo}*\n\n"
+                "📍 Envie a localização pelo botão abaixo.\n\n"
+                "Depois será solicitada a *foto da placa da rua* ou da *numeração mais próxima*.",
+                parse_mode="Markdown",
+                reply_markup=teclado_localizacao(),
+            )
+            await atualizar_painel(context)
+            return
+
+        if categoria == "Atenuacao" and subcategoria == "Numeração da NAP":
+            context.user_data["etapa"] = "atenuacao_numero_nap"
+            await msg.reply_text(
+                f"🎫 Protocolo: *{protocolo}*\n\n"
+                "🔢 Informe a numeração/identificação da NAP para atenuar:",
+                parse_mode="Markdown",
+            )
+            await atualizar_painel(context)
+            return
+
+        if categoria == "Atenuacao" and subcategoria == "Localização da NAP":
+            context.user_data["etapa"] = "atenuacao_localizacao_nap"
+            await msg.reply_text(
+                f"🎫 Protocolo: *{protocolo}*\n\n"
+                "📍 Envie a localização da NAP para atenuar pelo botão abaixo:",
+                parse_mode="Markdown",
+                reply_markup=teclado_localizacao(),
+            )
+            await atualizar_painel(context)
+            return
+
+        if categoria == "Outros" or (categoria == "Ativo" and subcategoria == "Outros"):
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "finalizou_fotos", "Direcionado direto ao COP")
+            await msg.reply_text(
+                f"✅ Solicitação registrada.\n🎫 {protocolo}\n\nSeu atendimento entrou na fila do COP.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data["etapa"] = "aguardando_cop"
+            await atualizar_painel(context)
+            return
+
         context.user_data["etapa"] = "fotos"
         teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
 
@@ -1071,6 +1152,155 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ Para essa opção de NAP é obrigatório enviar a localização pelo botão abaixo.",
             reply_markup=teclado_localizacao(),
         )
+        return
+
+    # Ativo - Cliente ausente: localização + foto da fachada.
+    if context.user_data.get("etapa") == "ativo_cliente_ausente_localizacao":
+        protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
+        ticket = buscar_ticket(protocolo) if protocolo else None
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text("Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        if msg.location:
+            atualizar_ticket(protocolo, latitude=msg.location.latitude, longitude=msg.location.longitude, last_message_at=now())
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "location", "Localização enviada", latitude=msg.location.latitude, longitude=msg.location.longitude)
+            context.user_data["etapa"] = "ativo_cliente_ausente_fachada"
+            await msg.reply_text(
+                "✅ Localização recebida.\n\n📸 Agora envie a *foto da fachada*.",
+                parse_mode="Markdown",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        await msg.reply_text("⚠️ Para cliente ausente, envie a localização pelo botão abaixo.", reply_markup=teclado_localizacao())
+        return
+
+    if context.user_data.get("etapa") == "ativo_cliente_ausente_fachada":
+        protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
+        ticket = buscar_ticket(protocolo) if protocolo else None
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text("Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        if msg.photo or msg.document:
+            msg_type, file_id, text = tipo_mensagem(msg)
+            fotos = (ticket.get("fotos") or 0) + 1
+            atualizar_ticket(protocolo, fotos=fotos, last_message_at=now())
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", msg_type, text or "Foto da fachada", file_id=file_id)
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "finalizou_fotos", "Cliente ausente - evidências enviadas")
+            await msg.reply_text(
+                f"✅ Foto da fachada recebida.\n🎫 {protocolo}\n\nSeu atendimento entrou na fila do COP.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data["etapa"] = "aguardando_cop"
+            await atualizar_painel(context)
+            return
+
+        await msg.reply_text("⚠️ Envie a foto da fachada para continuar.")
+        return
+
+    # Ativo - Endereço não localizado: localização + foto da placa da rua ou numeração próxima.
+    if context.user_data.get("etapa") == "ativo_endereco_nao_localizado_localizacao":
+        protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
+        ticket = buscar_ticket(protocolo) if protocolo else None
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text("Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        if msg.location:
+            atualizar_ticket(protocolo, latitude=msg.location.latitude, longitude=msg.location.longitude, last_message_at=now())
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "location", "Localização enviada", latitude=msg.location.latitude, longitude=msg.location.longitude)
+            context.user_data["etapa"] = "ativo_endereco_nao_localizado_foto"
+            await msg.reply_text(
+                "✅ Localização recebida.\n\n📸 Agora envie a *foto da placa da rua* ou da *numeração mais próxima*.",
+                parse_mode="Markdown",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        await msg.reply_text("⚠️ Para endereço não localizado, envie a localização pelo botão abaixo.", reply_markup=teclado_localizacao())
+        return
+
+    if context.user_data.get("etapa") == "ativo_endereco_nao_localizado_foto":
+        protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
+        ticket = buscar_ticket(protocolo) if protocolo else None
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text("Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        if msg.photo or msg.document:
+            msg_type, file_id, text = tipo_mensagem(msg)
+            fotos = (ticket.get("fotos") or 0) + 1
+            atualizar_ticket(protocolo, fotos=fotos, last_message_at=now())
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", msg_type, text or "Foto da placa da rua ou numeração próxima", file_id=file_id)
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "finalizou_fotos", "Endereço não localizado - evidências enviadas")
+            await msg.reply_text(
+                f"✅ Foto recebida.\n🎫 {protocolo}\n\nSeu atendimento entrou na fila do COP.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data["etapa"] = "aguardando_cop"
+            await atualizar_painel(context)
+            return
+
+        await msg.reply_text("⚠️ Envie a foto da placa da rua ou da numeração mais próxima para continuar.")
+        return
+
+    # Atenuação - numeração da NAP.
+    if context.user_data.get("etapa") == "atenuacao_numero_nap":
+        protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
+        ticket = buscar_ticket(protocolo) if protocolo else None
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text("Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        if msg.text:
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "text", f"Numeração da NAP para atenuar: {msg.text.strip()}")
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "finalizou_fotos", "Atenuação - numeração da NAP informada")
+            await msg.reply_text(
+                f"✅ Numeração da NAP recebida.\n🎫 {protocolo}\n\nSeu atendimento entrou na fila do COP.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data["etapa"] = "aguardando_cop"
+            await atualizar_painel(context)
+            return
+
+        await msg.reply_text("⚠️ Informe a numeração/identificação da NAP em texto.")
+        return
+
+    # Atenuação - localização da NAP.
+    if context.user_data.get("etapa") == "atenuacao_localizacao_nap":
+        protocolo = context.user_data.get("protocolo") or usuarios_em_chamado.get(user.id)
+        ticket = buscar_ticket(protocolo) if protocolo else None
+        if not ticket or ticket["status"] == "finalizado":
+            context.user_data.clear()
+            usuarios_em_chamado.pop(user.id, None)
+            await msg.reply_text("Esse atendimento já foi finalizado. Use /start para iniciar um novo atendimento.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        if msg.location:
+            atualizar_ticket(protocolo, latitude=msg.location.latitude, longitude=msg.location.longitude, last_message_at=now())
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "location", "Localização da NAP para atenuar", latitude=msg.location.latitude, longitude=msg.location.longitude)
+            registrar_msg(protocolo, user.id, user.full_name, "tecnico", "finalizou_fotos", "Atenuação - localização da NAP informada")
+            await msg.reply_text(
+                f"✅ Localização da NAP recebida.\n🎫 {protocolo}\n\nSeu atendimento entrou na fila do COP.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data["etapa"] = "aguardando_cop"
+            await atualizar_painel(context)
+            return
+
+        await msg.reply_text("⚠️ Envie a localização da NAP pelo botão abaixo.", reply_markup=teclado_localizacao())
         return
 
     # PSW recebendo localização obrigatória.
