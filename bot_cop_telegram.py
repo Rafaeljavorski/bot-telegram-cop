@@ -39,6 +39,7 @@ ADM_IDS = [
 # Eduardo assume no grupo principal e recebe o tópico no grupo EDUARDO BOT.
 COP_GROUPS = {
     8176848972: -1005562485186,  # Eduardo
+    8342651270: -1005133624770,  # Rafael - teste no grupo Supervisor
 }
 
 SUPERVISOR_GROUP_ID = -1005133624770
@@ -427,6 +428,12 @@ def destino_ticket(ticket):
 async def criar_topico_supervisor(context, protocolo, ticket):
     if not SUPERVISOR_GROUP_ID:
         return None
+
+    # Se o grupo individual do atendente já for o próprio grupo Supervisor,
+    # não cria um segundo tópico duplicado.
+    if ticket.get("grupo_atendente") == SUPERVISOR_GROUP_ID:
+        return None
+
     if ticket.get("supervisor_thread_id"):
         return ticket["supervisor_thread_id"]
 
@@ -681,6 +688,10 @@ async def listar_gestao_adm(query, context):
 async def enviar_copia_supervisor(context, protocolo, texto=None, msg=None):
     ticket = buscar_ticket(protocolo)
     if not ticket or not SUPERVISOR_GROUP_ID or not ticket.get("supervisor_thread_id"):
+        return
+
+    # Evita duplicar mensagens se o atendimento já está no grupo Supervisor.
+    if ticket.get("grupo_atendente") == SUPERVISOR_GROUP_ID:
         return
     try:
         if msg:
@@ -1690,12 +1701,27 @@ async def alerta_espera_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.warning("Erro ao enviar alerta de espera: %s", e)
 
 
+async def debug_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    await update.message.reply_text(
+        f"🧪 Debug do grupo\n\n"
+        f"Chat ID: `{chat.id}`\n"
+        f"Nome: *{chat.title or chat.full_name or '-'}*\n"
+        f"Tipo: `{chat.type}`\n"
+        f"É fórum/tópicos: `{getattr(chat, 'is_forum', None)}`\n"
+        f"Seu ID: `{user.id}`",
+        parse_mode="Markdown",
+    )
+
+
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("adm", adm))
     app.add_handler(CommandHandler("buscar", buscar))
+    app.add_handler(CommandHandler("debug", debug_grupo))
     app.add_handler(CallbackQueryHandler(botoes))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.VOICE | filters.LOCATION) & ~filters.COMMAND,
