@@ -39,10 +39,10 @@ ADM_IDS = [
 # Eduardo assume no grupo principal e recebe o tópico no grupo EDUARDO BOT.
 COP_GROUPS = {
     8176848972: -1005562485186,  # Eduardo
-    8342651270: -1005133624770,  # Rafael - teste no grupo Supervisor
+    8342651270: -1004381937733,  # Rafael - teste no grupo Supervisor
 }
 
-SUPERVISOR_GROUP_ID = -1005133624770
+SUPERVISOR_GROUP_ID = -1004381937733
 SUPERVISOR_IDS = [8342651270]
 
 
