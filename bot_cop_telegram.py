@@ -38,7 +38,7 @@ ADM_IDS = [
 # TESTE: tópicos separados por atendente.
 # Eduardo assume no grupo principal e recebe o tópico no grupo EDUARDO BOT.
 COP_GROUPS = {
-    8176848972: -1005562485186,  # Eduardo
+    8176848972: -1004293448057,  # Eduardo
     8342651270: -1004381937733,  # Rafael - teste no grupo Supervisor
 }
 
