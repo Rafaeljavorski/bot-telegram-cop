@@ -35,19 +35,30 @@ ADM_IDS = [
     if x.strip()
 ]
 
-# TESTE: tópicos separados por atendente.
-# Eduardo assume no grupo principal e recebe o tópico no grupo EDUARDO BOT.
+# Grupos individuais por atendente.
 COP_GROUPS = {
     8176848972: -1004293448057,  # Eduardo
-    8342651270: -1004381937733,  # Rafael - teste no grupo Supervisor
+    8342651270: -1004381937733,  # Rafael
     8649288570: -1003905148770,  # Julia
     8968758334: -1004458526402,  # Barbara
     8687881505: -1004315669101,  # Brian
-    7610106736: -1004468702049,  # Luana 
+    7610106736: -1004468702049,  # Luana
 }
 
-SUPERVISOR_GROUP_ID = -1004381937733
+COP_NAMES = {
+    8176848972: "Eduardo",
+    8342651270: "Rafael",
+    8649288570: "Julia",
+    8968758334: "Barbara",
+    8687881505: "Brian",
+    7610106736: "Luana",
+}
+
+SUPERVISOR_GROUP_ID = int(os.getenv("SUPERVISOR_GROUP_ID", "-1004381937733"))
 SUPERVISOR_IDS = [8342651270]
+
+ATENDIMENTO_PARADO_MIN = int(os.getenv("ATENDIMENTO_PARADO_MIN", "15"))
+SUPERVISOR_RESUMO_MIN = int(os.getenv("SUPERVISOR_RESUMO_MIN", "5"))
 
 
 if not BOT_TOKEN:
@@ -58,6 +69,7 @@ if not DATABASE_URL:
 
 usuarios_em_chamado = {}
 painel_message_id = None
+supervisor_message_id = None
 
 
 def eh_admin(user_id: int) -> bool:
@@ -145,7 +157,8 @@ def init_db():
                 historico_enviado INTEGER DEFAULT 0,
                 alertado_espera INTEGER DEFAULT 0,
                 grupo_atendente BIGINT,
-                supervisor_thread_id BIGINT
+                supervisor_thread_id BIGINT,
+                alertado_parado INTEGER DEFAULT 0
             )
             """)
             cur.execute("""
@@ -173,6 +186,7 @@ def init_db():
         add_column_if_missing(conn, "tickets", "alertado_espera", "INTEGER DEFAULT 0")
         add_column_if_missing(conn, "tickets", "grupo_atendente", "BIGINT")
         add_column_if_missing(conn, "tickets", "supervisor_thread_id", "BIGINT")
+        add_column_if_missing(conn, "tickets", "alertado_parado", "INTEGER DEFAULT 0")
 
         add_column_if_missing(conn, "messages", "file_id", "TEXT")
         add_column_if_missing(conn, "messages", "latitude", "DOUBLE PRECISION")
@@ -233,7 +247,7 @@ def registrar_msg(protocolo, sender_id, sender_name, sender_role, message_type, 
             longitude,
             now(),
         ))
-        conn.execute("UPDATE tickets SET last_message_at=%s WHERE protocolo=%s", (now(), protocolo))
+        conn.execute("UPDATE tickets SET last_message_at=%s, alertado_parado=0 WHERE protocolo=%s", (now(), protocolo))
 
 
 def buscar_ticket(protocolo):
@@ -302,8 +316,16 @@ def painel_texto():
             SELECT COUNT(*) c FROM tickets
             WHERE status='finalizado' AND DATE(closed_at::timestamp)=CURRENT_DATE
         """).fetchone()["c"]
+        carga_rows = conn.execute("""
+            SELECT atendente_id, atendente_nome, COUNT(*) total
+            FROM tickets
+            WHERE status='em_atendimento'
+            GROUP BY atendente_id, atendente_nome
+            ORDER BY total DESC, atendente_nome
+        """).fetchall()
 
     maior_espera = max([minutos(r["created_at"]) for r in aguardando] or [0])
+    carga_map = {int(r["atendente_id"]): r["total"] for r in carga_rows if r["atendente_id"]}
 
     linhas = [
         "📋 *FILA COP - ATENDIMENTOS*",
@@ -313,14 +335,22 @@ def painel_texto():
         f"✅ Finalizados hoje: *{finalizados}*",
         f"⏱️ Maior espera: *{maior_espera} min*",
         "",
-        "🟢 *EM ATENDIMENTO*",
+        "👥 *CARGA POR COP*",
     ]
 
+    for cop_id, nome in COP_NAMES.items():
+        total = carga_map.get(cop_id, 0)
+        emoji = "🟢" if total else "⚪"
+        linhas.append(f"{emoji} {nome}: *{total}*")
+
+    linhas.extend(["", "🟢 *EM ATENDIMENTO*"])
+
     if atendimento:
-        for r in atendimento[:10]:
+        for r in atendimento[:12]:
             atendente = r["atendente_nome"] or "Sem atendente"
             sub = f" / {r['subcategoria']}" if r["subcategoria"] else ""
-            linhas.append(f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']}{sub} - {atendente}")
+            tempo = minutos(r["assumed_at"]) if r["assumed_at"] else 0
+            linhas.append(f"🎫 {r['protocolo']} - {r['user_name']} - {r['categoria']}{sub} - {atendente} - {tempo} min")
     else:
         linhas.append("Nenhum atendimento em andamento.")
 
@@ -1705,6 +1735,202 @@ async def alerta_espera_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.warning("Erro ao enviar alerta de espera: %s", e)
 
 
+def supervisor_texto():
+    with db() as conn:
+        resumo = conn.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE status='aguardando') aguardando,
+                COUNT(*) FILTER (WHERE status='em_atendimento') em_atendimento,
+                COUNT(*) FILTER (WHERE status='finalizado' AND DATE(closed_at::timestamp)=CURRENT_DATE) finalizados_hoje
+            FROM tickets
+        """).fetchone()
+
+        cargas = conn.execute("""
+            SELECT atendente_id, atendente_nome, COUNT(*) total
+            FROM tickets
+            WHERE status='em_atendimento'
+            GROUP BY atendente_id, atendente_nome
+            ORDER BY total DESC
+        """).fetchall()
+
+        ranking = conn.execute("""
+            SELECT atendente_nome, COUNT(*) total
+            FROM tickets
+            WHERE status='finalizado'
+              AND atendente_nome IS NOT NULL
+              AND DATE(closed_at::timestamp)=CURRENT_DATE
+            GROUP BY atendente_nome
+            ORDER BY total DESC
+            LIMIT 10
+        """).fetchall()
+
+        medias = conn.execute("""
+            SELECT atendente_nome,
+                   ROUND(AVG(EXTRACT(EPOCH FROM (closed_at::timestamp - assumed_at::timestamp)) / 60.0)::numeric, 1) media_min
+            FROM tickets
+            WHERE status='finalizado'
+              AND atendente_nome IS NOT NULL
+              AND assumed_at IS NOT NULL
+              AND closed_at IS NOT NULL
+              AND DATE(closed_at::timestamp)=CURRENT_DATE
+            GROUP BY atendente_nome
+            ORDER BY media_min ASC
+            LIMIT 10
+        """).fetchall()
+
+        parados = conn.execute("""
+            SELECT protocolo, user_name, categoria, subcategoria, atendente_nome, last_message_at, assumed_at
+            FROM tickets
+            WHERE status='em_atendimento'
+            ORDER BY last_message_at ASC
+            LIMIT 50
+        """).fetchall()
+
+    carga_map = {int(r["atendente_id"]): r["total"] for r in cargas if r["atendente_id"]}
+
+    linhas = [
+        "🛠️ *PAINEL SUPERVISOR COP*",
+        "",
+        f"🟡 Aguardando: *{resumo['aguardando'] or 0}*",
+        f"🟢 Em atendimento: *{resumo['em_atendimento'] or 0}*",
+        f"✅ Finalizados hoje: *{resumo['finalizados_hoje'] or 0}*",
+        "",
+        "👥 *Em atendimento por COP*",
+    ]
+
+    for cop_id, nome in COP_NAMES.items():
+        total = carga_map.get(cop_id, 0)
+        emoji = "🟢" if total else "⚪"
+        linhas.append(f"{emoji} {nome}: *{total}*")
+
+    linhas.extend(["", "🏆 *Ranking de finalizados hoje*"])
+    if ranking:
+        medalhas = ["🥇", "🥈", "🥉"]
+        for i, r in enumerate(ranking, start=1):
+            medalha = medalhas[i-1] if i <= 3 else f"{i}º"
+            linhas.append(f"{medalha} {r['atendente_nome']}: *{r['total']}*")
+    else:
+        linhas.append("Sem finalizados hoje.")
+
+    linhas.extend(["", "⏱️ *Tempo médio hoje*"])
+    if medias:
+        for r in medias:
+            linhas.append(f"• {r['atendente_nome']}: *{r['media_min']} min*")
+    else:
+        linhas.append("Sem dados suficientes.")
+
+    linhas.extend(["", f"⚠️ *Sem movimentação +{ATENDIMENTO_PARADO_MIN} min*"])
+    encontrou = False
+    for r in parados:
+        base = r["last_message_at"] or r["assumed_at"]
+        tempo = minutos(base)
+        if tempo >= ATENDIMENTO_PARADO_MIN:
+            encontrou = True
+            sub = f" / {r['subcategoria']}" if r["subcategoria"] else ""
+            linhas.append(f"🚨 {r['protocolo']} - {r['user_name']} - {r['categoria']}{sub} - {r['atendente_nome']} - *{tempo} min*")
+    if not encontrou:
+        linhas.append("Nenhum atendimento parado.")
+
+    linhas.extend(["", f"🕘 Atualizado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"])
+    return "\n".join(linhas)
+
+
+def produtividade_texto():
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT
+                atendente_nome,
+                COUNT(*) total,
+                ROUND(AVG(EXTRACT(EPOCH FROM (closed_at::timestamp - assumed_at::timestamp)) / 60.0)::numeric, 1) media_min
+            FROM tickets
+            WHERE status='finalizado'
+              AND atendente_nome IS NOT NULL
+              AND DATE(closed_at::timestamp)=CURRENT_DATE
+            GROUP BY atendente_nome
+            ORDER BY total DESC
+        """).fetchall()
+
+    linhas = ["🏆 *PRODUTIVIDADE COP - HOJE*", ""]
+    if not rows:
+        linhas.append("Nenhum atendimento finalizado hoje.")
+    else:
+        for i, r in enumerate(rows, start=1):
+            linhas.append(f"{i}º {r['atendente_nome']} — ✅ *{r['total']}* | ⏱️ média *{r['media_min'] or '-'} min*")
+    linhas.append(f"\n🕘 Atualizado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    return "\n".join(linhas)
+
+
+async def supervisor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in SUPERVISOR_IDS and not eh_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Apenas supervisores/ADM podem usar este comando.")
+        return
+    await update.message.reply_text(supervisor_texto(), parse_mode="Markdown")
+
+
+async def produtividade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in SUPERVISOR_IDS and not eh_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Apenas supervisores/ADM podem usar este comando.")
+        return
+    await update.message.reply_text(produtividade_texto(), parse_mode="Markdown")
+
+
+async def atualizar_supervisor_painel(context: ContextTypes.DEFAULT_TYPE):
+    global supervisor_message_id
+    if not SUPERVISOR_GROUP_ID:
+        return
+    try:
+        if supervisor_message_id:
+            await context.bot.edit_message_text(
+                chat_id=SUPERVISOR_GROUP_ID,
+                message_id=supervisor_message_id,
+                text=supervisor_texto(),
+                parse_mode="Markdown",
+            )
+        else:
+            msg = await context.bot.send_message(
+                chat_id=SUPERVISOR_GROUP_ID,
+                text=supervisor_texto(),
+                parse_mode="Markdown",
+            )
+            supervisor_message_id = msg.message_id
+    except Exception as e:
+        logger.warning("Erro ao atualizar painel supervisor: %s", e)
+
+
+async def alerta_atendimento_parado_job(context: ContextTypes.DEFAULT_TYPE):
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT protocolo, user_name, categoria, subcategoria, atendente_nome, last_message_at, assumed_at
+            FROM tickets
+            WHERE status='em_atendimento'
+              AND COALESCE(alertado_parado, 0)=0
+            ORDER BY last_message_at ASC
+            LIMIT 50
+        """).fetchall()
+
+    for r in rows:
+        base = r["last_message_at"] or r["assumed_at"]
+        tempo = minutos(base)
+        if tempo >= ATENDIMENTO_PARADO_MIN:
+            sub = f" / {r['subcategoria']}" if r["subcategoria"] else ""
+            try:
+                await context.bot.send_message(
+                    chat_id=SUPERVISOR_GROUP_ID,
+                    text=(
+                        "⚠️ *Atendimento parado*\n\n"
+                        f"🎫 {r['protocolo']}\n"
+                        f"👤 Técnico: {r['user_name']}\n"
+                        f"📂 Fila: {r['categoria']}{sub}\n"
+                        f"👨‍💻 Atendente: {r['atendente_nome']}\n"
+                        f"⏱️ Sem movimentação há *{tempo} min*"
+                    ),
+                    parse_mode="Markdown",
+                )
+                atualizar_ticket(r["protocolo"], alertado_parado=1)
+            except Exception as e:
+                logger.warning("Erro ao enviar alerta de atendimento parado: %s", e)
+
+
 async def debug_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
@@ -1726,6 +1952,8 @@ def main():
     app.add_handler(CommandHandler("adm", adm))
     app.add_handler(CommandHandler("buscar", buscar))
     app.add_handler(CommandHandler("debug", debug_grupo))
+    app.add_handler(CommandHandler("supervisor", supervisor_cmd))
+    app.add_handler(CommandHandler("produtividade", produtividade_cmd))
     app.add_handler(CallbackQueryHandler(botoes))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.VOICE | filters.LOCATION) & ~filters.COMMAND,
@@ -1734,6 +1962,8 @@ def main():
 
     try:
         app.job_queue.run_repeating(alerta_espera_job, interval=60, first=60)
+        app.job_queue.run_repeating(alerta_atendimento_parado_job, interval=60, first=90)
+        app.job_queue.run_repeating(atualizar_supervisor_painel, interval=SUPERVISOR_RESUMO_MIN * 60, first=30)
     except Exception as e:
         logger.warning("Job queue não inicializada: %s", e)
 
