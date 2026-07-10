@@ -225,6 +225,28 @@ def atualizar_ticket(protocolo, **kwargs):
         conn.execute(f"UPDATE tickets SET {cols} WHERE protocolo=%s", values)
 
 
+def reivindicar_ticket(protocolo, novo_status, status_esperado):
+    """
+    Muda o status do ticket de forma atômica, só aplicando a mudança se o
+    status atual no banco ainda for o esperado (via UPDATE ... WHERE status=...).
+
+    Evita condições de corrida como:
+    - dois atendentes clicando "Atender próximo" ao mesmo tempo e assumindo o
+      mesmo chamado;
+    - dois cliques de "Finalizar" (ex.: atendente e supervisor) fechando o
+      mesmo tópico em duplicidade.
+
+    Retorna True se esta chamada conseguiu aplicar a mudança, False se outro
+    processo já tinha alterado o status antes (a "corrida" foi perdida).
+    """
+    with db() as conn:
+        row = conn.execute(
+            "UPDATE tickets SET status=%s WHERE protocolo=%s AND status=%s RETURNING id",
+            (novo_status, protocolo, status_esperado),
+        ).fetchone()
+        return row is not None
+
+
 def registrar_msg(protocolo, sender_id, sender_name, sender_role, message_type, text="", file_id=None, latitude=None, longitude=None):
     with db() as conn:
         conn.execute("""
@@ -814,6 +836,23 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
             )
         return
 
+    # Reivindica o chamado de forma atômica ANTES de criar o tópico.
+    # Isso evita que dois atendentes cliquem "Atender próximo"/"Assumir" ao
+    # mesmo tempo e ambos passem pelas checagens acima antes que o status
+    # seja de fato gravado no banco (condição de corrida clássica de
+    # "check-then-act").
+    conseguiu = reivindicar_ticket(protocolo, novo_status="em_atendimento", status_esperado="aguardando")
+    if not conseguiu:
+        ticket_atual = buscar_ticket(protocolo) or {}
+        atendente = ticket_atual.get("atendente_nome") or "outro atendente"
+        logger.info("Corrida ao assumir %s: %s perdeu para %s.", protocolo, user.full_name, atendente)
+        if origem_chat_id:
+            await context.bot.send_message(
+                chat_id=origem_chat_id,
+                text=f"⚠️ {protocolo} acabou de ser assumido por {atendente} (clique simultâneo)."
+            )
+        return
+
     if not ticket.get("message_thread_id") or ticket.get("grupo_atendente") != grupo_destino:
         try:
             await criar_topico_do_chamado(context, protocolo, ticket["user_name"], ticket["categoria"], grupo_destino=grupo_destino)
@@ -821,16 +860,21 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
             await enviar_cabecalho_topico(context, protocolo)
         except Exception as e:
             logger.exception("Erro ao criar tópico ao assumir: %s", e)
+            # Devolve o chamado para a fila: sem tópico criado, não faz
+            # sentido deixá-lo travado em "em_atendimento" sem atendente
+            # de fato atribuído.
+            reivindicar_ticket(protocolo, novo_status="aguardando", status_esperado="em_atendimento")
             if origem_chat_id:
                 await context.bot.send_message(
                     chat_id=origem_chat_id,
-                    text="⚠️ Não consegui criar o tópico no grupo individual. Verifique se o bot é admin e pode gerenciar tópicos."
+                    text="⚠️ Não consegui criar o tópico no grupo individual. O chamado voltou para a fila. Verifique se o bot é admin e pode gerenciar tópicos."
                 )
             return
 
+    # O status já foi reivindicado atomicamente acima; aqui só completamos
+    # os demais campos do atendimento.
     atualizar_ticket(
         protocolo,
-        status="em_atendimento",
         atendente_id=user.id,
         atendente_nome=user.full_name,
         assumed_at=now(),
@@ -852,12 +896,18 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
 
     await reenviar_historico_para_topico(context, protocolo)
 
-    await context.bot.send_message(
-        chat_id=grupo_destino,
-        message_thread_id=ticket["message_thread_id"],
-        text=f"✅ Atendimento assumido por *{user.full_name}*.",
-        parse_mode="Markdown",
-    )
+    # Sem try/except aqui antes: uma falha nesse envio (ex.: tópico
+    # temporariamente indisponível) pulava a atualização dos controles e do
+    # painel logo abaixo, mesmo com o chamado já assumido no banco.
+    try:
+        await context.bot.send_message(
+            chat_id=grupo_destino,
+            message_thread_id=ticket["message_thread_id"],
+            text=f"✅ Atendimento assumido por *{user.full_name}*.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("Não consegui enviar confirmação de assumir no tópico de %s: %s", protocolo, e)
 
     # Deixa os controles sempre como a última mensagem do tópico.
     await atualizar_controles_topico(context, protocolo)
@@ -881,10 +931,20 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
             await context.bot.send_message(chat_id=chat_id, text="Você não é o responsável por esse chamado.")
         return
 
+    # Reivindica o fechamento de forma atômica: evita que dois cliques quase
+    # simultâneos (ex.: atendente e supervisor apertando "Finalizar" ao mesmo
+    # tempo) disparem duas vezes as mensagens de encerramento e o fechamento
+    # do tópico.
+    conseguiu = reivindicar_ticket(protocolo, novo_status="finalizado", status_esperado=ticket["status"])
+    if not conseguiu:
+        logger.info("Corrida ao finalizar %s: outra ação já havia mudado o status.", protocolo)
+        return
+
+    atualizar_ticket(protocolo, closed_at=now(), last_message_at=now())
+
     # Remove a mensagem de controles antes de fechar o tópico.
     await remover_controles_topico(context, ticket)
 
-    atualizar_ticket(protocolo, status="finalizado", closed_at=now(), last_message_at=now())
     usuarios_em_chamado.pop(ticket["user_id"], None)
 
     try:
@@ -897,7 +957,8 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
             reply_markup=ReplyKeyboardRemove(),
         )
     except Exception:
-        pass
+        # Benigno na maioria das vezes (ex.: técnico bloqueou o bot).
+        logger.debug("Não consegui avisar o técnico %s sobre finalização de %s.", ticket["user_id"], protocolo)
 
     if ticket.get("message_thread_id"):
         try:
@@ -906,8 +967,8 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
                 message_thread_id=ticket["message_thread_id"],
                 name=f"{protocolo} - FINALIZADO",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Não consegui renomear o tópico de %s: %s", protocolo, e)
 
         # Fecha primeiro para a mensagem automática do Telegram não ficar por último.
         try:
@@ -915,8 +976,8 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
                 chat_id=destino_ticket(ticket),
                 message_thread_id=ticket["message_thread_id"],
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Não consegui fechar o tópico de %s: %s", protocolo, e)
 
         final_text = (
             "━━━━━━━━━━━━━━\n"
@@ -952,8 +1013,8 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
                     chat_id=destino_ticket(ticket),
                     message_thread_id=ticket["message_thread_id"],
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Falha ao enviar mensagem final de encerramento no tópico de %s: %s", protocolo, e)
 
     await atualizar_painel(context)
 
@@ -983,14 +1044,21 @@ async def devolver_ticket(protocolo, user, context, chat_id=None):
             text=f"🔄 Atendimento {protocolo} voltou para a fila do COP."
         )
     except Exception:
-        pass
+        logger.debug("Não consegui avisar o técnico %s sobre devolução de %s.", ticket["user_id"], protocolo)
 
     if ticket.get("message_thread_id"):
-        await context.bot.send_message(
-            chat_id=destino_ticket(ticket),
-            message_thread_id=ticket["message_thread_id"],
-            text=f"🔄 Atendimento devolvido para a fila por {user.full_name}.",
-        )
+        # Antes sem try/except: se o tópico já estivesse fechado/apagado,
+        # essa chamada lançava uma exceção não tratada que interrompia a
+        # função aqui, deixando o painel (atualizar_painel abaixo) sem
+        # atualizar.
+        try:
+            await context.bot.send_message(
+                chat_id=destino_ticket(ticket),
+                message_thread_id=ticket["message_thread_id"],
+                text=f"🔄 Atendimento devolvido para a fila por {user.full_name}.",
+            )
+        except Exception as e:
+            logger.warning("Não consegui avisar o tópico de %s sobre devolução: %s", protocolo, e)
 
     await atualizar_painel(context)
 
@@ -1147,22 +1215,32 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if ticket["status"] == "aguardando":
-                atualizar_ticket(
-                    ticket["protocolo"],
-                    status="em_atendimento",
-                    atendente_id=user.id,
-                    atendente_nome=user.full_name,
-                    assumed_at=now(),
-                    last_message_at=now(),
+                # Reivindica de forma atômica: se outro atendente já tiver
+                # assumido este mesmo chamado entre a leitura acima e agora,
+                # não sobrescrevemos o atendente_id/nome dele.
+                conseguiu = reivindicar_ticket(
+                    ticket["protocolo"], novo_status="em_atendimento", status_esperado="aguardando"
                 )
-                try:
-                    await context.bot.send_message(
-                        chat_id=ticket["user_id"],
-                        text=f"🔷 CIP Telecom\n\nSeu atendimento foi iniciado por: *{user.full_name}*\n🎫 Protocolo: *{ticket['protocolo']}*",
-                        parse_mode="Markdown",
+                if conseguiu:
+                    atualizar_ticket(
+                        ticket["protocolo"],
+                        atendente_id=user.id,
+                        atendente_nome=user.full_name,
+                        assumed_at=now(),
+                        last_message_at=now(),
                     )
-                except Exception:
-                    pass
+                    ticket["status"] = "em_atendimento"
+                    try:
+                        await context.bot.send_message(
+                            chat_id=ticket["user_id"],
+                            text=f"🔷 CIP Telecom\n\nSeu atendimento foi iniciado por: *{user.full_name}*\n🎫 Protocolo: *{ticket['protocolo']}*",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        logger.debug("Não consegui notificar o técnico %s sobre início do atendimento.", ticket["user_id"])
+                else:
+                    # Alguém já assumiu; recarrega para refletir o estado real.
+                    ticket = buscar_ticket(ticket["protocolo"]) or ticket
 
             registrar_msg(ticket["protocolo"], user.id, user.full_name, "atendente", "mensagem", msg.text or msg.caption or "")
             await encaminhar_mensagem(msg, context, ticket["user_id"], f"📩 {ticket['protocolo']} - COP {user.full_name}")
