@@ -158,7 +158,8 @@ def init_db():
                 alertado_espera INTEGER DEFAULT 0,
                 grupo_atendente BIGINT,
                 supervisor_thread_id BIGINT,
-                alertado_parado INTEGER DEFAULT 0
+                alertado_parado INTEGER DEFAULT 0,
+                control_message_id BIGINT
             )
             """)
             cur.execute("""
@@ -187,6 +188,7 @@ def init_db():
         add_column_if_missing(conn, "tickets", "grupo_atendente", "BIGINT")
         add_column_if_missing(conn, "tickets", "supervisor_thread_id", "BIGINT")
         add_column_if_missing(conn, "tickets", "alertado_parado", "INTEGER DEFAULT 0")
+        add_column_if_missing(conn, "tickets", "control_message_id", "BIGINT")
 
         add_column_if_missing(conn, "messages", "file_id", "TEXT")
         add_column_if_missing(conn, "messages", "latitude", "DOUBLE PRECISION")
@@ -748,6 +750,85 @@ async def enviar_copia_supervisor(context, protocolo, texto=None, msg=None):
         logger.warning("Falha ao enviar cópia para supervisor: %s", e)
 
 
+
+async def atualizar_controles_topico(context, protocolo):
+    """
+    Mantém uma única mensagem de controles no final do tópico.
+    A mensagem anterior é apagada e uma nova é enviada, ficando sempre por último.
+    """
+    ticket = buscar_ticket(protocolo)
+    if not ticket:
+        return
+
+    if ticket.get("status") != "em_atendimento":
+        return
+
+    grupo = destino_ticket(ticket)
+    thread_id = ticket.get("message_thread_id")
+    if not grupo or not thread_id:
+        return
+
+    mensagem_anterior = ticket.get("control_message_id")
+    if mensagem_anterior:
+        try:
+            await context.bot.delete_message(
+                chat_id=grupo,
+                message_id=mensagem_anterior,
+            )
+        except Exception:
+            pass
+
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"✅ Finalizar {protocolo}",
+            callback_data=f"topico_finalizar:{protocolo}"
+        )],
+        [InlineKeyboardButton(
+            "🔄 Devolver para fila",
+            callback_data=f"adm_devolver:{protocolo}"
+        )],
+    ])
+
+    try:
+        msg_controle = await context.bot.send_message(
+            chat_id=grupo,
+            message_thread_id=thread_id,
+            text=f"⚙️ *Controles do atendimento {protocolo}*",
+            parse_mode="Markdown",
+            reply_markup=teclado,
+            disable_notification=True,
+        )
+        atualizar_ticket(
+            protocolo,
+            control_message_id=msg_controle.message_id,
+        )
+    except Exception as e:
+        logger.warning(
+            "Não consegui atualizar os controles do atendimento %s: %s",
+            protocolo,
+            e,
+        )
+
+
+async def remover_controles_topico(context, ticket):
+    mensagem_controle = ticket.get("control_message_id")
+    grupo = destino_ticket(ticket)
+
+    if mensagem_controle and grupo:
+        try:
+            await context.bot.delete_message(
+                chat_id=grupo,
+                message_id=mensagem_controle,
+            )
+        except Exception:
+            pass
+
+    try:
+        atualizar_ticket(ticket["protocolo"], control_message_id=None)
+    except Exception:
+        pass
+
+
 async def assumir_proximo(query, context):
     with db() as conn:
         row = conn.execute("""
@@ -835,18 +916,15 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
     await reenviar_historico_para_topico(context, protocolo)
     await enviar_copia_supervisor(context, protocolo, "📎 *Histórico/evidências enviados ao atendente.*")
 
-    teclado = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Finalizar {protocolo}", callback_data=f"topico_finalizar:{protocolo}")],
-        [InlineKeyboardButton("🔄 Devolver para fila", callback_data=f"adm_devolver:{protocolo}")],
-    ])
-
     await context.bot.send_message(
         chat_id=grupo_destino,
         message_thread_id=ticket["message_thread_id"],
         text=f"✅ Atendimento assumido por *{user.full_name}*.",
         parse_mode="Markdown",
-        reply_markup=teclado,
     )
+
+    # Deixa os controles sempre como a última mensagem do tópico.
+    await atualizar_controles_topico(context, protocolo)
 
     if ticket.get("supervisor_thread_id"):
         await context.bot.send_message(
@@ -874,6 +952,9 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
         if chat_id:
             await context.bot.send_message(chat_id=chat_id, text="Você não é o responsável por esse chamado.")
         return
+
+    # Remove a mensagem de controles antes de fechar o tópico.
+    await remover_controles_topico(context, ticket)
 
     atualizar_ticket(protocolo, status="finalizado", closed_at=now(), last_message_at=now())
     usuarios_em_chamado.pop(ticket["user_id"], None)
@@ -970,6 +1051,9 @@ async def devolver_ticket(protocolo, user, context, chat_id=None):
         if chat_id:
             await context.bot.send_message(chat_id=chat_id, text="Chamado não encontrado.")
         return
+
+    # Remove os controles do tópico enquanto o chamado volta para a fila.
+    await remover_controles_topico(context, ticket)
 
     atualizar_ticket(
         protocolo,
@@ -1180,6 +1264,9 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             registrar_msg(ticket["protocolo"], user.id, user.full_name, "atendente", "mensagem", msg.text or msg.caption or "")
             await encaminhar_mensagem(msg, context, ticket["user_id"], f"📩 {ticket['protocolo']} - COP {user.full_name}")
             await enviar_copia_supervisor(context, ticket["protocolo"], msg=msg)
+
+            # Reposiciona os controles no final do tópico após cada resposta do COP.
+            await atualizar_controles_topico(context, ticket["protocolo"])
             await atualizar_painel(context)
         return
 
@@ -1602,6 +1689,9 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 thread_id=ticket["message_thread_id"],
             )
             await enviar_copia_supervisor(context, ticket["protocolo"], msg=msg)
+
+            if ticket.get("status") == "em_atendimento":
+                await atualizar_controles_topico(context, ticket["protocolo"])
         else:
             await msg.reply_text(f"✅ Informação adicionada ao chamado {ticket['protocolo']}.")
 
@@ -1630,6 +1720,9 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             thread_id=ticket_tecnico["message_thread_id"],
         )
         await enviar_copia_supervisor(context, ticket_tecnico["protocolo"], msg=msg)
+
+        # Reposiciona os controles no final após mensagem nova do técnico.
+        await atualizar_controles_topico(context, ticket_tecnico["protocolo"])
         return
 
     # Recebendo fotos/evidências antes de finalizar.
