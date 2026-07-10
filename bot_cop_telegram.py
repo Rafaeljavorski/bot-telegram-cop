@@ -1,6 +1,7 @@
 import os
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 import logging
 from datetime import datetime
 
@@ -64,6 +65,25 @@ if not BOT_TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("Configure a variável DATABASE_URL no Railway.")
 
+# Pool de conexões com o Postgres: reaproveita conexões já abertas em vez de
+# abrir/fechar uma conexão TCP nova a cada consulta. Isso evita travar o loop
+# de eventos do bot (assíncrono) a cada leitura/escrita no banco e reduz o
+# risco de esgotar o limite de conexões do Postgres sob uso simultâneo.
+DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "1"))
+DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
+
+pool = ConnectionPool(
+    DATABASE_URL,
+    min_size=DB_POOL_MIN_SIZE,
+    max_size=DB_POOL_MAX_SIZE,
+    kwargs={"row_factory": dict_row},
+    open=False,
+)
+try:
+    pool.open(wait=True, timeout=30)
+except Exception as e:
+    raise RuntimeError(f"Não foi possível conectar ao Postgres (DATABASE_URL) ao iniciar o pool: {e}")
+
 usuarios_em_chamado = {}
 painel_message_id = None
 
@@ -86,17 +106,22 @@ class CursorResult:
 
 class DBWrapper:
     def __init__(self):
-        self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        self.conn = pool.getconn()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if exc_type:
-            self.conn.rollback()
-        else:
-            self.conn.commit()
-        self.conn.close()
+        try:
+            if exc_type:
+                self.conn.rollback()
+            else:
+                self.conn.commit()
+        finally:
+            # Devolve a conexão ao pool para reuso, em vez de fechá-la.
+            # Conexões quebradas são detectadas e descartadas pelo próprio
+            # pool ao serem devolvidas.
+            pool.putconn(self.conn)
 
     def cursor(self):
         return self.conn.cursor()
@@ -1905,7 +1930,10 @@ def main():
     except Exception as e:
         logger.warning("Job queue não inicializada: %s", e)
 
-    app.run_polling()
+    try:
+        app.run_polling()
+    finally:
+        pool.close()
 
 
 if __name__ == "__main__":
