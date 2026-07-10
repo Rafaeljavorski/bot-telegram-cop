@@ -54,11 +54,8 @@ COP_NAMES = {
     7610106736: "Luana",
 }
 
-SUPERVISOR_GROUP_ID = int(os.getenv("SUPERVISOR_GROUP_ID", "-1004381937733"))
-SUPERVISOR_IDS = [8342651270]
 
 ATENDIMENTO_PARADO_MIN = int(os.getenv("ATENDIMENTO_PARADO_MIN", "15"))
-SUPERVISOR_RESUMO_MIN = int(os.getenv("SUPERVISOR_RESUMO_MIN", "5"))
 
 
 if not BOT_TOKEN:
@@ -69,7 +66,6 @@ if not DATABASE_URL:
 
 usuarios_em_chamado = {}
 painel_message_id = None
-supervisor_message_id = None
 
 
 def eh_admin(user_id: int) -> bool:
@@ -157,7 +153,6 @@ def init_db():
                 historico_enviado INTEGER DEFAULT 0,
                 alertado_espera INTEGER DEFAULT 0,
                 grupo_atendente BIGINT,
-                supervisor_thread_id BIGINT,
                 alertado_parado INTEGER DEFAULT 0,
                 control_message_id BIGINT
             )
@@ -186,7 +181,6 @@ def init_db():
         add_column_if_missing(conn, "tickets", "historico_enviado", "INTEGER DEFAULT 0")
         add_column_if_missing(conn, "tickets", "alertado_espera", "INTEGER DEFAULT 0")
         add_column_if_missing(conn, "tickets", "grupo_atendente", "BIGINT")
-        add_column_if_missing(conn, "tickets", "supervisor_thread_id", "BIGINT")
         add_column_if_missing(conn, "tickets", "alertado_parado", "INTEGER DEFAULT 0")
         add_column_if_missing(conn, "tickets", "control_message_id", "BIGINT")
 
@@ -273,14 +267,7 @@ def buscar_ticket_por_thread(thread_id, chat_id=None):
             """, (thread_id, chat_id)).fetchone()
             if row:
                 return dict(row)
-
-            row = conn.execute("""
-                SELECT * FROM tickets
-                WHERE supervisor_thread_id=%s
-                  AND status IN ('aguardando','em_atendimento')
-                ORDER BY id DESC LIMIT 1
-            """, (thread_id,)).fetchone()
-            return dict(row) if row else None
+            return None
 
     with db() as conn:
         row = conn.execute("""
@@ -460,26 +447,6 @@ def grupo_do_atendente(atendente_id):
 def destino_ticket(ticket):
     return ticket.get("grupo_atendente") or ATENDENTES_CHAT_ID
 
-
-async def criar_topico_supervisor(context, protocolo, ticket):
-    if not SUPERVISOR_GROUP_ID:
-        return None
-
-    # Se o grupo individual do atendente já for o próprio grupo Supervisor,
-    # não cria um segundo tópico duplicado.
-    if ticket.get("grupo_atendente") == SUPERVISOR_GROUP_ID:
-        return None
-
-    if ticket.get("supervisor_thread_id"):
-        return ticket["supervisor_thread_id"]
-
-    titulo = f"{protocolo} - {ticket['user_name'][:18]} - {ticket['categoria']}"
-    topico = await context.bot.create_forum_topic(
-        chat_id=SUPERVISOR_GROUP_ID,
-        name=titulo[:128],
-    )
-    atualizar_ticket(protocolo, supervisor_thread_id=topico.message_thread_id)
-    return topico.message_thread_id
 
 
 async def criar_topico_do_chamado(context, protocolo, user_name, categoria, grupo_destino=None):
@@ -721,35 +688,6 @@ async def listar_gestao_adm(query, context):
     await query.message.reply_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(botoes))
 
 
-async def enviar_copia_supervisor(context, protocolo, texto=None, msg=None):
-    ticket = buscar_ticket(protocolo)
-    if not ticket or not SUPERVISOR_GROUP_ID or not ticket.get("supervisor_thread_id"):
-        return
-
-    # Evita duplicar mensagens se o atendimento já está no grupo Supervisor.
-    if ticket.get("grupo_atendente") == SUPERVISOR_GROUP_ID:
-        return
-    try:
-        if msg:
-            await encaminhar_mensagem(
-                msg,
-                context,
-                SUPERVISOR_GROUP_ID,
-                f"📩 {protocolo} - Cópia Supervisor",
-                thread_id=ticket["supervisor_thread_id"],
-                responder_erro=False,
-            )
-        elif texto:
-            await context.bot.send_message(
-                chat_id=SUPERVISOR_GROUP_ID,
-                message_thread_id=ticket["supervisor_thread_id"],
-                text=texto,
-                parse_mode="Markdown",
-            )
-    except Exception as e:
-        logger.warning("Falha ao enviar cópia para supervisor: %s", e)
-
-
 
 async def atualizar_controles_topico(context, protocolo):
     """
@@ -881,7 +819,6 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
             await criar_topico_do_chamado(context, protocolo, ticket["user_name"], ticket["categoria"], grupo_destino=grupo_destino)
             ticket = buscar_ticket(protocolo)
             await enviar_cabecalho_topico(context, protocolo)
-            await criar_topico_supervisor(context, protocolo, ticket)
         except Exception as e:
             logger.exception("Erro ao criar tópico ao assumir: %s", e)
             if origem_chat_id:
@@ -914,7 +851,6 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
         pass
 
     await reenviar_historico_para_topico(context, protocolo)
-    await enviar_copia_supervisor(context, protocolo, "📎 *Histórico/evidências enviados ao atendente.*")
 
     await context.bot.send_message(
         chat_id=grupo_destino,
@@ -925,14 +861,6 @@ async def assumir_ticket(protocolo, user, context, origem_chat_id=None):
 
     # Deixa os controles sempre como a última mensagem do tópico.
     await atualizar_controles_topico(context, protocolo)
-
-    if ticket.get("supervisor_thread_id"):
-        await context.bot.send_message(
-            chat_id=SUPERVISOR_GROUP_ID,
-            message_thread_id=ticket["supervisor_thread_id"],
-            text=f"✅ Atendimento assumido por *{user.full_name}*.",
-            parse_mode="Markdown",
-        )
 
     await atualizar_painel(context)
 
@@ -1027,21 +955,6 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
             except Exception:
                 pass
 
-    if ticket.get("supervisor_thread_id"):
-        try:
-            await context.bot.send_message(
-                chat_id=SUPERVISOR_GROUP_ID,
-                message_thread_id=ticket["supervisor_thread_id"],
-                text=final_text if 'final_text' in locals() else f"✅ Atendimento {protocolo} finalizado por {user.full_name}.",
-                parse_mode="Markdown",
-            )
-            await context.bot.close_forum_topic(
-                chat_id=SUPERVISOR_GROUP_ID,
-                message_thread_id=ticket["supervisor_thread_id"],
-            )
-        except Exception:
-            pass
-
     await atualizar_painel(context)
 
 
@@ -1078,16 +991,6 @@ async def devolver_ticket(protocolo, user, context, chat_id=None):
             message_thread_id=ticket["message_thread_id"],
             text=f"🔄 Atendimento devolvido para a fila por {user.full_name}.",
         )
-
-    if ticket.get("supervisor_thread_id"):
-        try:
-            await context.bot.send_message(
-                chat_id=SUPERVISOR_GROUP_ID,
-                message_thread_id=ticket["supervisor_thread_id"],
-                text=f"🔄 Atendimento devolvido para a fila por {user.full_name}.",
-            )
-        except Exception:
-            pass
 
     await atualizar_painel(context)
 
@@ -1263,15 +1166,10 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             registrar_msg(ticket["protocolo"], user.id, user.full_name, "atendente", "mensagem", msg.text or msg.caption or "")
             await encaminhar_mensagem(msg, context, ticket["user_id"], f"📩 {ticket['protocolo']} - COP {user.full_name}")
-            await enviar_copia_supervisor(context, ticket["protocolo"], msg=msg)
 
             # Reposiciona os controles no final do tópico após cada resposta do COP.
             await atualizar_controles_topico(context, ticket["protocolo"])
             await atualizar_painel(context)
-        return
-
-    if chat_id_atual == SUPERVISOR_GROUP_ID and msg.message_thread_id:
-        # Grupo Supervisor é apenas acompanhamento nesse teste.
         return
 
     # Técnico informando contrato.
@@ -1688,7 +1586,6 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📩 {ticket['protocolo']} - {user.full_name}",
                 thread_id=ticket["message_thread_id"],
             )
-            await enviar_copia_supervisor(context, ticket["protocolo"], msg=msg)
 
             if ticket.get("status") == "em_atendimento":
                 await atualizar_controles_topico(context, ticket["protocolo"])
@@ -1719,7 +1616,6 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📩 {ticket_tecnico['protocolo']} - {user.full_name}",
             thread_id=ticket_tecnico["message_thread_id"],
         )
-        await enviar_copia_supervisor(context, ticket_tecnico["protocolo"], msg=msg)
 
         # Reposiciona os controles no final após mensagem nova do técnico.
         await atualizar_controles_topico(context, ticket_tecnico["protocolo"])
@@ -1828,105 +1724,6 @@ async def alerta_espera_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.warning("Erro ao enviar alerta de espera: %s", e)
 
 
-def supervisor_texto():
-    with db() as conn:
-        resumo = conn.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE status='aguardando') aguardando,
-                COUNT(*) FILTER (WHERE status='em_atendimento') em_atendimento,
-                COUNT(*) FILTER (WHERE status='finalizado' AND DATE(closed_at::timestamp)=CURRENT_DATE) finalizados_hoje
-            FROM tickets
-        """).fetchone()
-
-        cargas = conn.execute("""
-            SELECT atendente_id, atendente_nome, COUNT(*) total
-            FROM tickets
-            WHERE status='em_atendimento'
-            GROUP BY atendente_id, atendente_nome
-            ORDER BY total DESC
-        """).fetchall()
-
-        ranking = conn.execute("""
-            SELECT atendente_nome, COUNT(*) total
-            FROM tickets
-            WHERE status='finalizado'
-              AND atendente_nome IS NOT NULL
-              AND DATE(closed_at::timestamp)=CURRENT_DATE
-            GROUP BY atendente_nome
-            ORDER BY total DESC
-            LIMIT 10
-        """).fetchall()
-
-        medias = conn.execute("""
-            SELECT atendente_nome,
-                   ROUND(AVG(EXTRACT(EPOCH FROM (closed_at::timestamp - assumed_at::timestamp)) / 60.0)::numeric, 1) media_min
-            FROM tickets
-            WHERE status='finalizado'
-              AND atendente_nome IS NOT NULL
-              AND assumed_at IS NOT NULL
-              AND closed_at IS NOT NULL
-              AND DATE(closed_at::timestamp)=CURRENT_DATE
-            GROUP BY atendente_nome
-            ORDER BY media_min ASC
-            LIMIT 10
-        """).fetchall()
-
-        parados = conn.execute("""
-            SELECT protocolo, user_name, categoria, subcategoria, atendente_nome, last_message_at, assumed_at
-            FROM tickets
-            WHERE status='em_atendimento'
-            ORDER BY last_message_at ASC
-            LIMIT 50
-        """).fetchall()
-
-    carga_map = {int(r["atendente_id"]): r["total"] for r in cargas if r["atendente_id"]}
-
-    linhas = [
-        "🛠️ *PAINEL SUPERVISOR COP*",
-        "",
-        f"🟡 Aguardando: *{resumo['aguardando'] or 0}*",
-        f"🟢 Em atendimento: *{resumo['em_atendimento'] or 0}*",
-        f"✅ Finalizados hoje: *{resumo['finalizados_hoje'] or 0}*",
-        "",
-        "👥 *Em atendimento por COP*",
-    ]
-
-    for cop_id, nome in COP_NAMES.items():
-        total = carga_map.get(cop_id, 0)
-        emoji = "🟢" if total else "⚪"
-        linhas.append(f"{emoji} {nome}: *{total}*")
-
-    linhas.extend(["", "🏆 *Ranking de finalizados hoje*"])
-    if ranking:
-        medalhas = ["🥇", "🥈", "🥉"]
-        for i, r in enumerate(ranking, start=1):
-            medalha = medalhas[i-1] if i <= 3 else f"{i}º"
-            linhas.append(f"{medalha} {r['atendente_nome']}: *{r['total']}*")
-    else:
-        linhas.append("Sem finalizados hoje.")
-
-    linhas.extend(["", "⏱️ *Tempo médio hoje*"])
-    if medias:
-        for r in medias:
-            linhas.append(f"• {r['atendente_nome']}: *{r['media_min']} min*")
-    else:
-        linhas.append("Sem dados suficientes.")
-
-    linhas.extend(["", f"⚠️ *Sem movimentação +{ATENDIMENTO_PARADO_MIN} min*"])
-    encontrou = False
-    for r in parados:
-        base = r["last_message_at"] or r["assumed_at"]
-        tempo = minutos(base)
-        if tempo >= ATENDIMENTO_PARADO_MIN:
-            encontrou = True
-            sub = f" / {r['subcategoria']}" if r["subcategoria"] else ""
-            linhas.append(f"🚨 {r['protocolo']} - {r['user_name']} - {r['categoria']}{sub} - {r['atendente_nome']} - *{tempo} min*")
-    if not encontrou:
-        linhas.append("Nenhum atendimento parado.")
-
-    linhas.extend(["", f"🕘 Atualizado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"])
-    return "\n".join(linhas)
-
 
 def produtividade_texto():
     with db() as conn:
@@ -1953,41 +1750,13 @@ def produtividade_texto():
     return "\n".join(linhas)
 
 
-async def supervisor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in SUPERVISOR_IDS and not eh_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Apenas supervisores/ADM podem usar este comando.")
-        return
-    await update.message.reply_text(supervisor_texto(), parse_mode="Markdown")
-
 
 async def produtividade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in SUPERVISOR_IDS and not eh_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Apenas supervisores/ADM podem usar este comando.")
+    if not eh_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Apenas administradores podem usar este comando.")
         return
     await update.message.reply_text(produtividade_texto(), parse_mode="Markdown")
 
-
-async def atualizar_supervisor_painel(context: ContextTypes.DEFAULT_TYPE):
-    global supervisor_message_id
-    if not SUPERVISOR_GROUP_ID:
-        return
-    try:
-        if supervisor_message_id:
-            await context.bot.edit_message_text(
-                chat_id=SUPERVISOR_GROUP_ID,
-                message_id=supervisor_message_id,
-                text=supervisor_texto(),
-                parse_mode="Markdown",
-            )
-        else:
-            msg = await context.bot.send_message(
-                chat_id=SUPERVISOR_GROUP_ID,
-                text=supervisor_texto(),
-                parse_mode="Markdown",
-            )
-            supervisor_message_id = msg.message_id
-    except Exception as e:
-        logger.warning("Erro ao atualizar painel supervisor: %s", e)
 
 
 async def alerta_atendimento_parado_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2008,7 +1777,7 @@ async def alerta_atendimento_parado_job(context: ContextTypes.DEFAULT_TYPE):
             sub = f" / {r['subcategoria']}" if r["subcategoria"] else ""
             try:
                 await context.bot.send_message(
-                    chat_id=SUPERVISOR_GROUP_ID,
+                    chat_id=ATENDENTES_CHAT_ID,
                     text=(
                         "⚠️ *Atendimento parado*\n\n"
                         f"🎫 {r['protocolo']}\n"
@@ -2045,7 +1814,6 @@ def main():
     app.add_handler(CommandHandler("adm", adm))
     app.add_handler(CommandHandler("buscar", buscar))
     app.add_handler(CommandHandler("debug", debug_grupo))
-    app.add_handler(CommandHandler("supervisor", supervisor_cmd))
     app.add_handler(CommandHandler("produtividade", produtividade_cmd))
     app.add_handler(CallbackQueryHandler(botoes))
     app.add_handler(MessageHandler(
@@ -2056,7 +1824,6 @@ def main():
     try:
         app.job_queue.run_repeating(alerta_espera_job, interval=60, first=60)
         app.job_queue.run_repeating(alerta_atendimento_parado_job, interval=60, first=90)
-        app.job_queue.run_repeating(atualizar_supervisor_painel, interval=SUPERVISOR_RESUMO_MIN * 60, first=30)
     except Exception as e:
         logger.warning("Job queue não inicializada: %s", e)
 
