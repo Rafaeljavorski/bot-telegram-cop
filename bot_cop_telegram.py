@@ -37,6 +37,11 @@ ADM_IDS = [
 ]
 
 # Grupos individuais por atendente.
+#
+# IMPORTANTE: a partir de agora, isso NÃO é mais lido em tempo de execução —
+# serve só de semente (uma vez só) pra tabela `atendentes` no banco, pra não
+# perder ninguém na transição. Atendente novo é cadastrado pelo próprio bot
+# (menu "👥 Atendentes"), não editando essas linhas. Pode deixar como está.
 COP_GROUPS = {
     8176848972: -1004293448057,  # Eduardo
     8342651270: -1004381937733,  # Rafael
@@ -218,6 +223,18 @@ def init_db():
                 valor TEXT
             )
             """)
+            # Atendentes (COPs): nome + grupo do Telegram + Telegram user_id.
+            # Substitui os dicionários fixos COP_GROUPS/COP_NAMES do código —
+            # atendente novo é cadastrado pelo próprio bot, sem editar/redeployar.
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS atendentes (
+                user_id BIGINT PRIMARY KEY,
+                nome TEXT NOT NULL,
+                grupo_id BIGINT NOT NULL,
+                ativo BOOLEAN NOT NULL DEFAULT TRUE,
+                criado_em TEXT
+            )
+            """)
         conn.commit()
 
         add_column_if_missing(conn, "tickets", "message_thread_id", "BIGINT")
@@ -253,6 +270,78 @@ def salvar_estado(chave, valor):
             """,
             (chave, str(valor)),
         )
+
+
+def seed_atendentes_iniciais():
+    """
+    Roda só UMA VEZ na vida do bot (controlado por uma flag no bot_state):
+    copia os atendentes que hoje estão fixos em COP_GROUPS/COP_NAMES para a
+    tabela `atendentes`, para não perder ninguém na transição. Depois disso,
+    adicionar/remover atendente é feito pelo próprio bot — essa função nunca
+    mais sobrescreve nada (mesmo que o código com os dicionários antigos
+    continue no repositório).
+    """
+    if obter_estado("seed_atendentes_feito"):
+        return
+    with db() as conn:
+        for user_id, grupo_id in COP_GROUPS.items():
+            nome = COP_NAMES.get(user_id, str(user_id))
+            conn.execute(
+                """
+                INSERT INTO atendentes (user_id, nome, grupo_id, ativo, criado_em)
+                VALUES (%s, %s, %s, TRUE, %s)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (user_id, nome, grupo_id, now()),
+            )
+    salvar_estado("seed_atendentes_feito", "1")
+    logger.info("Seed inicial de atendentes concluído (%d atendente(s) do código migrado(s) para o banco).", len(COP_GROUPS))
+
+
+def listar_atendentes(somente_ativos=True):
+    with db() as conn:
+        if somente_ativos:
+            rows = conn.execute(
+                "SELECT user_id, nome, grupo_id, ativo FROM atendentes WHERE ativo=TRUE ORDER BY nome"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT user_id, nome, grupo_id, ativo FROM atendentes ORDER BY nome"
+            ).fetchall()
+        return rows
+
+
+def grupo_do_atendente(atendente_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT grupo_id FROM atendentes WHERE user_id=%s AND ativo=TRUE", (atendente_id,)
+        ).fetchone()
+        return row["grupo_id"] if row else None
+
+
+def grupos_atendimento_set():
+    with db() as conn:
+        rows = conn.execute("SELECT grupo_id FROM atendentes WHERE ativo=TRUE").fetchall()
+        return {r["grupo_id"] for r in rows}
+
+
+def adicionar_atendente(user_id, nome, grupo_id):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO atendentes (user_id, nome, grupo_id, ativo, criado_em)
+            VALUES (%s, %s, %s, TRUE, %s)
+            ON CONFLICT (user_id) DO UPDATE SET nome=EXCLUDED.nome, grupo_id=EXCLUDED.grupo_id, ativo=TRUE
+            """,
+            (user_id, nome, grupo_id, now()),
+        )
+
+
+def remover_atendente(user_id):
+    """'Remove' de forma reversível (soft delete) — mantém o histórico de
+    chamados antigos desse atendente intacto e permite reativar depois."""
+    with db() as conn:
+        conn.execute("UPDATE atendentes SET ativo=FALSE WHERE user_id=%s", (user_id,))
 
 
 def minutos(dt_iso):
@@ -412,7 +501,8 @@ def painel_texto():
         "👥 *CARGA POR COP*",
     ]
 
-    for cop_id, nome in COP_NAMES.items():
+    for r_atendente in listar_atendentes():
+        cop_id, nome = r_atendente["user_id"], r_atendente["nome"]
         total = carga_map.get(cop_id, 0)
         emoji = "🟢" if total else "⚪"
         linhas.append(f"{emoji} {nome}: *{total}*")
@@ -447,11 +537,21 @@ def teclado_painel():
         [InlineKeyboardButton("✅ Atender próximo", callback_data="assumir_proximo")],
         [InlineKeyboardButton("📌 Escolher atendimento", callback_data="adm_escolher")],
         [InlineKeyboardButton("🛠️ Gestão ADM", callback_data="adm_gestao")],
+        [InlineKeyboardButton("👥 Atendentes", callback_data="adm_atendentes")],
         [InlineKeyboardButton("🔄 Atualizar painel", callback_data="atualizar_painel")],
     ])
 
 
-async def atualizar_painel(context: ContextTypes.DEFAULT_TYPE):
+def teclado_atendentes_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Listar atendentes", callback_data="adm_listar_atendentes")],
+        [InlineKeyboardButton("➕ Adicionar atendente", callback_data="adm_add_atendente")],
+        [InlineKeyboardButton("➖ Remover atendente", callback_data="adm_rm_atendente_menu")],
+        [InlineKeyboardButton("⬅️ Voltar ao painel", callback_data="atualizar_painel")],
+    ])
+
+
+async def atualizar_painel(context: ContextTypes.DEFAULT_TYPE, reposicionar=False):
     global painel_message_id
     if not ATENDENTES_CHAT_ID:
         return
@@ -468,6 +568,21 @@ async def atualizar_painel(context: ContextTypes.DEFAULT_TYPE):
                 painel_message_id = int(salvo)
             except ValueError:
                 painel_message_id = None
+
+    if reposicionar and painel_message_id:
+        # Traz o painel de volta para o fim da conversa: apaga a mensagem
+        # antiga e manda uma nova (já fixada), em vez de só editar no
+        # lugar. Usado especificamente quando um alerta de espera ou de
+        # atendimento parado é disparado — é justamente quando os COPs
+        # mais precisam enxergar o painel sem precisar procurar, e o
+        # painel reaparece logo abaixo do próprio alerta.
+        try:
+            await context.bot.delete_message(chat_id=ATENDENTES_CHAT_ID, message_id=painel_message_id)
+        except Exception as e:
+            logger.debug("Não consegui apagar o painel antigo ao reposicionar: %s", e)
+        painel_message_id = None
+        await _criar_e_fixar_painel(context)
+        return
 
     try:
         if painel_message_id:
@@ -552,10 +667,6 @@ def teclado_localizacao():
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-
-
-def grupo_do_atendente(atendente_id):
-    return COP_GROUPS.get(atendente_id)
 
 
 def destino_ticket(ticket):
@@ -701,6 +812,47 @@ async def adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await enviar_menu_adm(context, update.effective_chat.id)
 
 
+async def vincular_grupo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Último passo do cadastro de atendente: rodar /vincular DENTRO do grupo
+    dedicado do novo atendente. Como context.user_data é por usuário (não
+    por chat), o admin pode começar o cadastro no privado com o bot e vir
+    até aqui, no grupo novo, sem perder o que já foi preenchido.
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not eh_admin(user.id):
+        return  # comando administrativo: ignora silenciosamente pra quem não é admin
+
+    if context.user_data.get("admin_etapa") != "aguardando_vinculo_grupo":
+        await update.message.reply_text(
+            "Não tem nenhum cadastro de atendente em andamento. Comece pelo botão "
+            "\"👥 Atendentes\" → \"➕ Adicionar atendente\" no painel."
+        )
+        return
+
+    nome = context.user_data.get("novo_atendente_nome")
+    novo_user_id = context.user_data.get("novo_atendente_user_id")
+    if not nome or not novo_user_id:
+        await update.message.reply_text(
+            "Faltou uma etapa anterior. Comece de novo pelo botão \"➕ Adicionar atendente\"."
+        )
+        context.user_data.pop("admin_etapa", None)
+        return
+
+    adicionar_atendente(novo_user_id, nome, chat.id)
+
+    context.user_data.pop("admin_etapa", None)
+    context.user_data.pop("novo_atendente_nome", None)
+    context.user_data.pop("novo_atendente_user_id", None)
+
+    await update.message.reply_text(
+        f"✅ Atendente *{nome}* cadastrado e vinculado a este grupo!\nJá pode começar a receber atendimentos.",
+        parse_mode="Markdown",
+    )
+
+
 async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     termo = " ".join(context.args).strip()
     if not termo:
@@ -805,6 +957,74 @@ async def listar_gestao_adm(query, context):
 
     await query.message.reply_text(texto, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(botoes))
 
+
+async def mostrar_menu_atendentes(query, context):
+    await query.message.reply_text(
+        "👥 *Gerenciar atendentes*\n\nEscolha uma opção:",
+        parse_mode="Markdown",
+        reply_markup=teclado_atendentes_menu(),
+    )
+
+
+async def listar_atendentes_texto(query, context):
+    ativos = listar_atendentes(somente_ativos=True)
+    if not ativos:
+        await query.message.reply_text("Nenhum atendente cadastrado ainda.")
+        return
+    linhas = ["👥 *Atendentes cadastrados:*\n"]
+    for a in ativos:
+        linhas.append(f"🟢 {a['nome']} — grupo `{a['grupo_id']}` — id `{a['user_id']}`")
+    await query.message.reply_text("\n".join(linhas), parse_mode="Markdown")
+
+
+async def iniciar_adicionar_atendente(query, context):
+    context.user_data["admin_etapa"] = "aguardando_nome_atendente"
+    context.user_data.pop("novo_atendente_nome", None)
+    context.user_data.pop("novo_atendente_user_id", None)
+    await query.message.reply_text(
+        "➕ *Adicionar atendente*\n\n"
+        "Passo 1 de 3 — qual é o nome desse atendente? (envie por texto aqui mesmo)",
+        parse_mode="Markdown",
+    )
+
+
+async def iniciar_remover_atendente(query, context):
+    ativos = listar_atendentes(somente_ativos=True)
+    if not ativos:
+        await query.message.reply_text("Nenhum atendente cadastrado pra remover.")
+        return
+    botoes = [
+        [InlineKeyboardButton(f"➖ {a['nome']}", callback_data=f"adm_rm_atendente:{a['user_id']}")]
+        for a in ativos
+    ]
+    botoes.append([InlineKeyboardButton("⬅️ Cancelar", callback_data="adm_atendentes")])
+    await query.message.reply_text(
+        "➖ *Remover atendente*\n\nQual atendente você quer remover?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(botoes),
+    )
+
+
+async def confirmar_remover_atendente(query, context, user_id):
+    with db() as conn:
+        row = conn.execute("SELECT nome FROM atendentes WHERE user_id=%s", (user_id,)).fetchone()
+    nome = row["nome"] if row else str(user_id)
+    await query.message.reply_text(
+        f"Tem certeza que quer remover *{nome}*? Os chamados antigos dele continuam no histórico normalmente.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Sim, remover", callback_data=f"adm_rm_confirma:{user_id}")],
+            [InlineKeyboardButton("⬅️ Cancelar", callback_data="adm_atendentes")],
+        ]),
+    )
+
+
+async def executar_remover_atendente(query, context, user_id):
+    with db() as conn:
+        row = conn.execute("SELECT nome FROM atendentes WHERE user_id=%s", (user_id,)).fetchone()
+    nome = row["nome"] if row else str(user_id)
+    remover_atendente(user_id)
+    await query.message.reply_text(f"✅ {nome} removido(a). Pode reativar depois adicionando de novo, se precisar.")
 
 
 
@@ -1277,6 +1497,12 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (data.startswith("adm_assumir:"), "⛔ Apenas administradores podem assumir atendimento específico."),
         (data.startswith("adm_encerrar:"), "⛔ Apenas administradores podem encerrar chamados."),
         (data.startswith("adm_devolver:"), "⛔ Apenas administradores podem devolver chamados."),
+        (data == "adm_atendentes", "⛔ Apenas administradores podem gerenciar atendentes."),
+        (data == "adm_listar_atendentes", "⛔ Apenas administradores podem gerenciar atendentes."),
+        (data == "adm_add_atendente", "⛔ Apenas administradores podem gerenciar atendentes."),
+        (data == "adm_rm_atendente_menu", "⛔ Apenas administradores podem gerenciar atendentes."),
+        (data.startswith("adm_rm_atendente:"), "⛔ Apenas administradores podem gerenciar atendentes."),
+        (data.startswith("adm_rm_confirma:"), "⛔ Apenas administradores podem gerenciar atendentes."),
     ]
     for e_esta_acao, aviso in admin_gates:
         if e_esta_acao and not eh_admin(user.id):
@@ -1391,6 +1617,32 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await listar_gestao_adm(query, context)
         return
 
+    if data == "adm_atendentes":
+        await mostrar_menu_atendentes(query, context)
+        return
+
+    if data == "adm_listar_atendentes":
+        await listar_atendentes_texto(query, context)
+        return
+
+    if data == "adm_add_atendente":
+        await iniciar_adicionar_atendente(query, context)
+        return
+
+    if data == "adm_rm_atendente_menu":
+        await iniciar_remover_atendente(query, context)
+        return
+
+    if data.startswith("adm_rm_atendente:"):
+        user_id_remover = int(data.split(":", 1)[1])
+        await confirmar_remover_atendente(query, context, user_id_remover)
+        return
+
+    if data.startswith("adm_rm_confirma:"):
+        user_id_remover = int(data.split(":", 1)[1])
+        await executar_remover_atendente(query, context, user_id_remover)
+        return
+
     if data == "atualizar_painel":
         await atualizar_painel(context)
         return
@@ -1421,6 +1673,74 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def tratar_etapa_admin_atendente(update, context):
+    """
+    Cuida dos passos do fluxo "Adicionar atendente" (nome -> encaminhar
+    mensagem do atendente -> /vincular dentro do grupo novo). Retorna True
+    se tratou a mensagem aqui — nesse caso, tratar_mensagem NÃO deve
+    continuar processando a mesma mensagem como se fosse parte de um
+    chamado normal.
+    """
+    etapa = context.user_data.get("admin_etapa")
+    if not etapa:
+        return False
+
+    msg = update.message
+    user = update.effective_user
+
+    if not eh_admin(user.id):
+        # Não deveria conseguir chegar aqui sem ser admin, mas por
+        # segurança limpa o estado e deixa o fluxo normal seguir.
+        context.user_data.pop("admin_etapa", None)
+        return False
+
+    if etapa == "aguardando_nome_atendente":
+        nome = (msg.text or "").strip()
+        if not nome:
+            await msg.reply_text("Manda o nome em texto, por favor.")
+            return True
+        context.user_data["novo_atendente_nome"] = nome
+        context.user_data["admin_etapa"] = "aguardando_forward_atendente"
+        await msg.reply_text(
+            f"Combinado, *{nome}*.\n\n"
+            "Passo 2 de 3 — peça pra essa pessoa te mandar qualquer mensagem no privado, "
+            "e ENCAMINHE (forward) essa mensagem pra mim aqui.",
+            parse_mode="Markdown",
+        )
+        return True
+
+    if etapa == "aguardando_forward_atendente":
+        origem = msg.forward_origin
+        if not origem:
+            await msg.reply_text(
+                "Isso não parece uma mensagem encaminhada. Peça pro atendente mandar "
+                "qualquer coisa pra você e encaminhe (forward) ela pra mim aqui."
+            )
+            return True
+        if origem.type != "user":
+            await msg.reply_text(
+                "Não consegui identificar quem mandou essa mensagem originalmente "
+                "(a pessoa deve estar com a privacidade de encaminhamento ativada no Telegram). "
+                "Peça pra ela mandar /start diretamente pra mim numa conversa privada e tente "
+                "encaminhar de novo, ou peça pra ela desativar essa configuração de privacidade."
+            )
+            return True
+
+        novo_id = origem.sender_user.id
+        nome = context.user_data.get("novo_atendente_nome", "atendente")
+        context.user_data["novo_atendente_user_id"] = novo_id
+        context.user_data["admin_etapa"] = "aguardando_vinculo_grupo"
+        await msg.reply_text(
+            f"Peguei o ID de *{nome}*: `{novo_id}`.\n\n"
+            "Passo 3 de 3 — agora vá até o grupo dedicado (já criado, com o bot como admin) "
+            "e envie lá dentro o comando /vincular",
+            parse_mode="Markdown",
+        )
+        return True
+
+    return False
+
+
 async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user = update.effective_user
@@ -1434,6 +1754,11 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user and getattr(user, "is_bot", False):
         return
 
+    # Fluxo de cadastro de atendente em andamento tem prioridade sobre
+    # qualquer outra interpretação da mensagem (nome do atendente, ou a
+    # mensagem encaminhada que identifica o novo atendente).
+    if await tratar_etapa_admin_atendente(update, context):
+        return
 
     # Limpa sessão antiga se o usuário não tem ticket ativo.
     ticket_ativo = obter_ticket_ativo_usuario(user.id)
@@ -1443,7 +1768,7 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Mensagem enviada dentro de um tópico do grupo individual do atendente: vai para o técnico correto.
     chat_id_atual = update.effective_chat.id if update.effective_chat else None
-    grupos_atendimento = set(COP_GROUPS.values())
+    grupos_atendimento = grupos_atendimento_set()
     if chat_id_atual in grupos_atendimento and msg.message_thread_id:
         ticket = buscar_ticket_por_thread(msg.message_thread_id, chat_id_atual)
         if ticket and ticket["status"] in ["aguardando", "em_atendimento"]:
@@ -2018,6 +2343,7 @@ async def alerta_espera_job(context: ContextTypes.DEFAULT_TYPE):
             ORDER BY id ASC
         """).fetchall()
 
+    algum_alerta_enviado = False
     for r in rows:
         espera = minutos(r["created_at"])
         if espera >= ALERTA_ESPERA_MIN:
@@ -2034,8 +2360,15 @@ async def alerta_espera_job(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                 )
                 atualizar_ticket(r["protocolo"], alertado_espera=1)
+                algum_alerta_enviado = True
             except Exception as e:
                 logger.warning("Erro ao enviar alerta de espera: %s", e)
+
+    if algum_alerta_enviado:
+        # Traz o painel de volta pra baixo, logo após o(s) alerta(s) —
+        # exatamente o momento em que os COPs mais precisam achar o botão
+        # "Atender próximo" sem precisar procurar.
+        await atualizar_painel(context, reposicionar=True)
 
 
 
@@ -2084,6 +2417,7 @@ async def alerta_atendimento_parado_job(context: ContextTypes.DEFAULT_TYPE):
             LIMIT 50
         """).fetchall()
 
+    algum_alerta_enviado = False
     for r in rows:
         base = r["last_message_at"] or r["assumed_at"]
         tempo = minutos(base)
@@ -2103,8 +2437,12 @@ async def alerta_atendimento_parado_job(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                 )
                 atualizar_ticket(r["protocolo"], alertado_parado=1)
+                algum_alerta_enviado = True
             except Exception as e:
                 logger.warning("Erro ao enviar alerta de atendimento parado: %s", e)
+
+    if algum_alerta_enviado:
+        await atualizar_painel(context, reposicionar=True)
 
 
 async def debug_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2123,9 +2461,11 @@ async def debug_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
+    seed_atendentes_iniciais()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("adm", adm))
+    app.add_handler(CommandHandler("vincular", vincular_grupo_cmd))
     app.add_handler(CommandHandler("buscar", buscar))
     app.add_handler(CommandHandler("debug", debug_grupo))
     app.add_handler(CommandHandler("produtividade", produtividade_cmd))
