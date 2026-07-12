@@ -208,6 +208,16 @@ def init_db():
                 created_at TEXT
             )
             """)
+            # Tabela simples de chave/valor para guardar estadinhos do bot
+            # que precisam sobreviver a um restart do processo (ex.: qual é
+            # o message_id do painel fixado) — sem isso, a cada redeploy no
+            # Railway o bot "esquece" e cria um painel novo do zero.
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                chave TEXT PRIMARY KEY,
+                valor TEXT
+            )
+            """)
         conn.commit()
 
         add_column_if_missing(conn, "tickets", "message_thread_id", "BIGINT")
@@ -226,6 +236,23 @@ def init_db():
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
+
+
+def obter_estado(chave, default=None):
+    with db() as conn:
+        row = conn.execute("SELECT valor FROM bot_state WHERE chave=%s", (chave,)).fetchone()
+        return row["valor"] if row else default
+
+
+def salvar_estado(chave, valor):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_state (chave, valor) VALUES (%s, %s)
+            ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor
+            """,
+            (chave, str(valor)),
+        )
 
 
 def minutos(dt_iso):
@@ -429,6 +456,19 @@ async def atualizar_painel(context: ContextTypes.DEFAULT_TYPE):
     if not ATENDENTES_CHAT_ID:
         return
 
+    # Se este processo acabou de subir (ex.: depois de um redeploy no
+    # Railway), painel_message_id em memória está vazio. Recupera o ID
+    # salvo no banco da última vez, para continuar editando a MESMA
+    # mensagem (e ela seguir fixada) em vez de criar uma nova a cada
+    # reinício do bot.
+    if painel_message_id is None:
+        salvo = obter_estado("painel_message_id")
+        if salvo:
+            try:
+                painel_message_id = int(salvo)
+            except ValueError:
+                painel_message_id = None
+
     try:
         if painel_message_id:
             await context.bot.edit_message_text(
@@ -439,22 +479,38 @@ async def atualizar_painel(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=teclado_painel(),
             )
         else:
-            msg = await context.bot.send_message(
-                chat_id=ATENDENTES_CHAT_ID,
-                text=painel_texto(),
-                parse_mode="Markdown",
-                reply_markup=teclado_painel(),
-            )
-            painel_message_id = msg.message_id
+            await _criar_e_fixar_painel(context)
     except Exception as e:
         logger.warning("Erro ao atualizar painel: %s", e)
-        msg = await context.bot.send_message(
+        await _criar_e_fixar_painel(context)
+
+
+async def _criar_e_fixar_painel(context: ContextTypes.DEFAULT_TYPE):
+    """Manda uma mensagem nova de painel, salva o ID (sobrevive a restart)
+    e fixa (pin) no chat — assim os COPs sempre encontram o painel numa
+    barrinha fixa no topo, mesmo com alertas e outras mensagens chegando
+    depois dele."""
+    global painel_message_id
+
+    msg = await context.bot.send_message(
+        chat_id=ATENDENTES_CHAT_ID,
+        text=painel_texto(),
+        parse_mode="Markdown",
+        reply_markup=teclado_painel(),
+    )
+    painel_message_id = msg.message_id
+    salvar_estado("painel_message_id", msg.message_id)
+
+    try:
+        await context.bot.pin_chat_message(
             chat_id=ATENDENTES_CHAT_ID,
-            text=painel_texto(),
-            parse_mode="Markdown",
-            reply_markup=teclado_painel(),
+            message_id=msg.message_id,
+            disable_notification=True,
         )
-        painel_message_id = msg.message_id
+    except Exception as e:
+        logger.warning(
+            "Não consegui fixar o painel (verifique se o bot é admin com permissão de fixar mensagens): %s", e
+        )
 
 
 def menu_principal():
