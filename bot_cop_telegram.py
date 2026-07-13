@@ -4,6 +4,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram import (
     Update,
@@ -251,8 +252,22 @@ def init_db():
         add_column_if_missing(conn, "messages", "latitude", "DOUBLE PRECISION")
         add_column_if_missing(conn, "messages", "longitude", "DOUBLE PRECISION")
 
+# O servidor (Railway) roda em UTC, não no horário de Brasília — um
+# datetime.now() puro fica 3 horas adiantado. Usamos isso pra pegar o
+# horário de Brasília de verdade e então tiramos o timezone (.replace
+# (tzinfo=None)) pra manter o mesmo formato de string "ingênuo" (sem
+# indicação de fuso) que já é usado em todo o banco — só que agora com o
+# valor certo. TODO horário absoluto do bot (não diferenças de tempo) deve
+# vir daqui, nunca de datetime.now() puro.
+TZ_BRASIL = ZoneInfo("America/Sao_Paulo")
+
+
+def agora():
+    return datetime.now(TZ_BRASIL).replace(tzinfo=None)
+
+
 def now():
-    return datetime.now().isoformat(timespec="seconds")
+    return agora().isoformat(timespec="seconds")
 
 
 def obter_estado(chave, default=None):
@@ -347,7 +362,7 @@ def remover_atendente(user_id):
 def minutos(dt_iso):
     try:
         dt = datetime.fromisoformat(dt_iso)
-        return int((datetime.now() - dt).total_seconds() // 60)
+        return int((agora() - dt).total_seconds() // 60)
     except Exception:
         return 0
 
@@ -472,13 +487,14 @@ def limpar_sessao_usuario(context: ContextTypes.DEFAULT_TYPE, user_id: int):
 
 
 def painel_texto():
+    hoje = agora().date()
     with db() as conn:
         aguardando = conn.execute("SELECT * FROM tickets WHERE status='aguardando' ORDER BY id ASC").fetchall()
         atendimento = conn.execute("SELECT * FROM tickets WHERE status='em_atendimento' ORDER BY assumed_at ASC").fetchall()
         finalizados = conn.execute("""
             SELECT COUNT(*) c FROM tickets
-            WHERE status='finalizado' AND DATE(closed_at::timestamp)=CURRENT_DATE
-        """).fetchone()["c"]
+            WHERE status='finalizado' AND DATE(closed_at::timestamp)=%s
+        """, (hoje,)).fetchone()["c"]
         carga_rows = conn.execute("""
             SELECT atendente_id, atendente_nome, COUNT(*) total
             FROM tickets
@@ -528,7 +544,7 @@ def painel_texto():
     else:
         linhas.append("Fila vazia no momento.")
 
-    linhas.extend(["", f"🕘 Atualizado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"])
+    linhas.extend(["", f"🕘 Atualizado em {agora().strftime('%d/%m/%Y %H:%M:%S')}"])
     return "\n".join(linhas)
 
 
@@ -1402,7 +1418,7 @@ async def finalizar_ticket(protocolo, user, context, chat_id=None, admin=False):
             "━━━━━━━━━━━━━━\n"
             f"🎫 Protocolo: *{protocolo}*\n"
             f"👨‍💻 Atendente: *{user.full_name}*\n"
-            f"🕒 Horário: *{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}*\n"
+            f"🕒 Horário: *{agora().strftime('%d/%m/%Y %H:%M:%S')}*\n"
             "━━━━━━━━━━━━━━"
         )
 
@@ -2373,6 +2389,7 @@ async def alerta_espera_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def produtividade_texto():
+    hoje = agora().date()
     with db() as conn:
         rows = conn.execute("""
             SELECT
@@ -2382,10 +2399,10 @@ def produtividade_texto():
             FROM tickets
             WHERE status='finalizado'
               AND atendente_nome IS NOT NULL
-              AND DATE(closed_at::timestamp)=CURRENT_DATE
+              AND DATE(closed_at::timestamp)=%s
             GROUP BY atendente_nome
             ORDER BY total DESC
-        """).fetchall()
+        """, (hoje,)).fetchall()
 
     linhas = ["🏆 *PRODUTIVIDADE COP - HOJE*", ""]
     if not rows:
@@ -2393,7 +2410,7 @@ def produtividade_texto():
     else:
         for i, r in enumerate(rows, start=1):
             linhas.append(f"{i}º {r['atendente_nome']} — ✅ *{r['total']}* | ⏱️ média *{r['media_min'] or '-'} min*")
-    linhas.append(f"\n🕘 Atualizado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    linhas.append(f"\n🕘 Atualizado em {agora().strftime('%d/%m/%Y %H:%M:%S')}")
     return "\n".join(linhas)
 
 
