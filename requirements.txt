@@ -1,3 +1,5 @@
 python-telegram-bot[job-queue]==21.6
 psycopg[binary]==3.2.3
 psycopg-pool==3.2.3
+# Flask é usado pelo dashboard_app.py (serviço separado do bot no Railway)
+Flask==3.1.3
