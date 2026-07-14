@@ -814,6 +814,28 @@ def tipo_mensagem(msg):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    # Antes de limpar o estado e abrir um atendimento novo, checa se esse
+    # técnico já tem um chamado em aberto no banco. Sem essa checagem, um
+    # /start no meio de um atendimento (por engano, ou clicando num botão
+    # antigo) criava um SEGUNDO chamado duplicado, já que context.user_data
+    # é só memória local — limpar ela não fecha o chamado que já existe.
+    ticket_ativo = obter_ticket_ativo_usuario(user.id)
+    if ticket_ativo:
+        status_texto = "aguardando na fila" if ticket_ativo["status"] == "aguardando" else "em atendimento"
+        await update.message.reply_text(
+            f"⚠️ Você já tem um atendimento em aberto:\n\n"
+            f"🎫 Protocolo: *{ticket_ativo['protocolo']}*\n"
+            f"📌 Status: {status_texto}\n\n"
+            "Continue por aqui mesmo — não é preciso abrir um atendimento novo.",
+            parse_mode="Markdown",
+        )
+        # Restaura o protocolo no user_data, caso tenha se perdido (ex.: o
+        # bot reiniciou entre uma mensagem e outra).
+        context.user_data["protocolo"] = ticket_ativo["protocolo"]
+        return
+
     context.user_data.clear()
     await update.message.reply_text(
         "👋 Bem-vindo ao COP CIP Telecom.\n\nEscolha uma opção:",
@@ -866,6 +888,29 @@ async def vincular_grupo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         f"✅ Atendente *{nome}* cadastrado e vinculado a este grupo!\nJá pode começar a receber atendimentos.",
         parse_mode="Markdown",
+    )
+
+
+async def encerrar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Deixa o PRÓPRIO TÉCNICO encerrar o chamado dele (ex.: resolveu sozinho,
+    abriu por engano, não precisa mais de ajuda), sem depender de um
+    atendente pra fechar. Pede confirmação antes, pra evitar fechar sem querer.
+    """
+    user = update.effective_user
+    ticket = obter_ticket_ativo_usuario(user.id)
+    if not ticket:
+        await update.message.reply_text("Você não tem nenhum atendimento em aberto no momento.")
+        return
+
+    await update.message.reply_text(
+        f"Tem certeza que quer encerrar o chamado *{ticket['protocolo']}*?\n\n"
+        "Se precisar de ajuda de novo depois, é só usar /start e abrir um atendimento novo.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Sim, encerrar", callback_data=f"tecnico_encerrar:{ticket['protocolo']}")],
+            [InlineKeyboardButton("❌ Não, continuar aberto", callback_data="tecnico_encerrar_cancelar")],
+        ]),
     )
 
 
@@ -1563,6 +1608,19 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("categoria:"):
+        # Mesma checagem do /start: se o botão que a pessoa tocou é de uma
+        # mensagem antiga (de um atendimento que já foi aberto), não deixa
+        # começar um chamado novo duplicado. Usa reply_text (não um segundo
+        # query.answer — o Telegram só aceita responder um clique de botão
+        # uma vez, e a linha 1550 já responde isso pra todo callback).
+        ticket_ativo = obter_ticket_ativo_usuario(user.id)
+        if ticket_ativo:
+            await query.message.reply_text(
+                f"⚠️ Você já tem o chamado *{ticket_ativo['protocolo']}* em aberto. Continue por aqui mesmo.",
+                parse_mode="Markdown",
+            )
+            return
+
         categoria = data.split(":", 1)[1]
 
         if categoria == "Ativo":
@@ -1686,6 +1744,59 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("adm_devolver:"):
         protocolo = data.split(":", 1)[1]
         await devolver_ticket(protocolo, user, context, query.message.chat_id)
+        return
+
+    if data.startswith("tecnico_encerrar:"):
+        protocolo = data.split(":", 1)[1]
+        ticket = buscar_ticket(protocolo)
+        if not ticket or ticket["user_id"] != user.id:
+            await query.message.reply_text("Não encontrei esse chamado, ou ele não é seu.")
+            return
+        if ticket["status"] == "finalizado":
+            await query.message.reply_text("Esse chamado já estava finalizado.")
+            return
+
+        # Mesmo padrão atômico usado no resto do bot: evita corrida se um
+        # atendente estiver finalizando esse mesmo chamado ao mesmo tempo.
+        conseguiu = reivindicar_ticket(protocolo, novo_status="finalizado", status_esperado=ticket["status"])
+        if not conseguiu:
+            await query.message.reply_text("Esse chamado acabou de ser alterado (talvez o atendente já tenha mexido nele).")
+            return
+
+        atualizar_ticket(protocolo, closed_at=now(), last_message_at=now())
+        registrar_msg(protocolo, user.id, user.full_name, "sistema", "mensagem", "Chamado encerrado pelo próprio técnico.")
+        usuarios_em_chamado.pop(user.id, None)
+
+        await query.message.reply_text(
+            f"✅ Chamado {protocolo} encerrado. Se precisar, é só abrir um novo atendimento com /start."
+        )
+
+        # Se já tinha atendente/tópico, avisa e fecha — mesmo se ainda
+        # estava "aguardando" (sem tópico), não quebra nada aqui.
+        if ticket.get("message_thread_id") and ticket.get("grupo_atendente"):
+            try:
+                await context.bot.send_message(
+                    chat_id=ticket["grupo_atendente"],
+                    message_thread_id=ticket["message_thread_id"],
+                    text=f"ℹ️ O técnico encerrou o chamado {protocolo} por conta própria (não precisava mais de ajuda).",
+                )
+                await context.bot.edit_forum_topic(
+                    chat_id=ticket["grupo_atendente"],
+                    message_thread_id=ticket["message_thread_id"],
+                    name=f"✅ {protocolo} - FINALIZADO",
+                )
+                await context.bot.close_forum_topic(
+                    chat_id=ticket["grupo_atendente"],
+                    message_thread_id=ticket["message_thread_id"],
+                )
+            except Exception as e:
+                logger.warning("Erro ao avisar/fechar tópico após técnico encerrar %s: %s", protocolo, e)
+
+        await atualizar_painel(context)
+        return
+
+    if data == "tecnico_encerrar_cancelar":
+        await query.message.reply_text("Combinado, o chamado continua aberto.")
         return
 
 
@@ -2483,6 +2594,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("adm", adm))
     app.add_handler(CommandHandler("vincular", vincular_grupo_cmd))
+    app.add_handler(CommandHandler("encerrar", encerrar_cmd))
     app.add_handler(CommandHandler("buscar", buscar))
     app.add_handler(CommandHandler("debug", debug_grupo))
     app.add_handler(CommandHandler("produtividade", produtividade_cmd))
