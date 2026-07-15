@@ -1733,7 +1733,10 @@ async def botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("topico_finalizar:"):
         protocolo = data.split(":", 1)[1]
-        await finalizar_ticket(protocolo, user, context, query.message.chat_id)
+        # Admin pode finalizar qualquer chamado, mesmo um que outro
+        # atendente assumiu — sem isso, o botão "Finalizar" dentro do
+        # tópico tratava admin igual atendente comum e recusava.
+        await finalizar_ticket(protocolo, user, context, query.message.chat_id, admin=eh_admin(user.id))
         return
 
     if data.startswith("adm_encerrar:"):
