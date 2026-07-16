@@ -13,6 +13,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     KeyboardButton,
+    InputMediaPhoto,
 )
 from telegram.ext import (
     Application,
@@ -741,6 +742,32 @@ async def enviar_cabecalho_topico(context, protocolo):
     )
 
 
+def agrupar_fotos_consecutivas(msgs):
+    """
+    Divide a lista de mensagens em blocos: fotos consecutivas viram um
+    único bloco ('fotos', [até 10 mensagens]), o resto vira bloco
+    ('unico', mensagem) — usado pra mandar várias fotos juntas como álbum
+    em vez de uma bolha enorme por foto (o Telegram tem esse recurso
+    nativo, sendMediaGroup, só que o bot não usava).
+    """
+    blocos = []
+    i = 0
+    while i < len(msgs):
+        m = msgs[i]
+        if m["message_type"] == "photo":
+            grupo = [m]
+            j = i + 1
+            while j < len(msgs) and msgs[j]["message_type"] == "photo" and len(grupo) < 10:
+                grupo.append(msgs[j])
+                j += 1
+            blocos.append(("fotos", grupo))
+            i = j
+        else:
+            blocos.append(("unico", m))
+            i += 1
+    return blocos
+
+
 async def reenviar_historico_para_topico(context, protocolo):
     ticket = buscar_ticket(protocolo)
     if not ticket or not ticket.get("message_thread_id"):
@@ -769,16 +796,34 @@ async def reenviar_historico_para_topico(context, protocolo):
         parse_mode="Markdown",
     )
 
-    for m in msgs:
+    for tipo_bloco, item in agrupar_fotos_consecutivas(msgs):
         try:
+            if tipo_bloco == "fotos":
+                grupo = item
+                if len(grupo) == 1:
+                    m = grupo[0]
+                    legenda = f"📩 {protocolo} - {m['sender_name']}"
+                    if m["text"]:
+                        legenda += f"\n\n{m['text']}"
+                    await context.bot.send_photo(chat_id=destino_ticket(ticket), message_thread_id=thread_id, photo=m["file_id"], caption=legenda)
+                else:
+                    # sendMediaGroup só aceita legenda no primeiro item do
+                    # álbum — o Telegram mostra ela como legenda do álbum todo.
+                    primeira_legenda = f"📩 {protocolo} - {grupo[0]['sender_name']}"
+                    media = [
+                        InputMediaPhoto(media=g["file_id"], caption=primeira_legenda if idx == 0 else None)
+                        for idx, g in enumerate(grupo)
+                    ]
+                    await context.bot.send_media_group(chat_id=destino_ticket(ticket), message_thread_id=thread_id, media=media)
+                continue
+
+            m = item
             legenda = f"📩 {protocolo} - {m['sender_name']}"
             if m["text"]:
                 legenda += f"\n\n{m['text']}"
 
             if m["message_type"] == "text":
                 await context.bot.send_message(chat_id=destino_ticket(ticket), message_thread_id=thread_id, text=legenda)
-            elif m["message_type"] == "photo":
-                await context.bot.send_photo(chat_id=destino_ticket(ticket), message_thread_id=thread_id, photo=m["file_id"], caption=legenda)
             elif m["message_type"] == "document":
                 await context.bot.send_document(chat_id=destino_ticket(ticket), message_thread_id=thread_id, document=m["file_id"], caption=legenda)
             elif m["message_type"] == "video":
