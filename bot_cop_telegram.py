@@ -2393,12 +2393,13 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if ticket.get("message_thread_id"):
-            await encaminhar_mensagem(
+            await encaminhar_mensagem_com_agrupamento(
                 msg,
                 context,
                 destino_ticket(ticket),
                 f"📩 {ticket['protocolo']} - {user.full_name}",
-                thread_id=ticket["message_thread_id"],
+                ticket["message_thread_id"],
+                ticket["protocolo"],
             )
 
             if ticket.get("status") == "em_atendimento":
@@ -2423,12 +2424,13 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             latitude=msg.location.latitude if msg.location else None,
             longitude=msg.location.longitude if msg.location else None,
         )
-        await encaminhar_mensagem(
+        await encaminhar_mensagem_com_agrupamento(
             msg,
             context,
             destino_ticket(ticket_tecnico),
             f"📩 {ticket_tecnico['protocolo']} - {user.full_name}",
-            thread_id=ticket_tecnico["message_thread_id"],
+            ticket_tecnico["message_thread_id"],
+            ticket_tecnico["protocolo"],
         )
 
         # Reposiciona os controles no final após mensagem nova do técnico.
@@ -2508,6 +2510,85 @@ async def encaminhar_mensagem(msg, context, destino, cabecalho, thread_id=None, 
                 await msg.reply_text("Não consegui encaminhar a mensagem.")
             except Exception:
                 pass
+
+
+# Fotos de um mesmo álbum (o técnico seleciona várias e manda juntas) chegam
+# ao bot como Updates SEPARADOS, cada um com o mesmo media_group_id. Esse
+# buffer junta elas antes de mandar pro tópico, pra virar 1 álbum em vez de
+# uma bolha por foto.
+_media_groups_pendentes = {}
+
+
+async def _flush_media_group(context: ContextTypes.DEFAULT_TYPE):
+    """Roda depois do "silêncio" de um álbum (nenhuma foto nova chegou por
+    ~1.5s) — manda tudo que foi bufferizado como um álbum só."""
+    dados = context.job.data
+    itens = _media_groups_pendentes.pop(dados["media_group_id"], None)
+    if not itens:
+        return
+
+    destino = dados["destino"]
+    thread_id = dados["thread_id"]
+    cabecalho = dados["cabecalho"]
+    protocolo = dados["protocolo"]
+
+    if len(itens) == 1:
+        await encaminhar_mensagem(itens[0], context, destino, cabecalho, thread_id=thread_id)
+    else:
+        try:
+            kwargs = {"chat_id": destino}
+            if thread_id:
+                kwargs["message_thread_id"] = thread_id
+            media = [
+                InputMediaPhoto(media=m.photo[-1].file_id, caption=f"{cabecalho}\n\n{m.caption or ''}" if idx == 0 else None)
+                for idx, m in enumerate(itens)
+            ]
+            await context.bot.send_media_group(**kwargs, media=media)
+        except Exception as e:
+            logger.warning("Falha ao mandar álbum ao vivo pro tópico de %s: %s", protocolo, e)
+
+    # Reposiciona os controles DEPOIS do álbum ter sido mandado — se
+    # fizesse isso só na hora de cada foto chegar, os controles ficariam
+    # "presos" acima do álbum, que só é enviado depois do delay.
+    try:
+        ticket = buscar_ticket(protocolo)
+        if ticket and ticket.get("status") == "em_atendimento":
+            await atualizar_controles_topico(context, protocolo)
+    except Exception as e:
+        logger.warning("Falha ao reposicionar controles após álbum de %s: %s", protocolo, e)
+
+
+async def encaminhar_mensagem_com_agrupamento(msg, context, destino, cabecalho, thread_id, protocolo):
+    """
+    Igual encaminhar_mensagem, mas quando a mensagem é uma foto que faz
+    parte de um álbum (media_group_id — o técnico mandou várias fotos
+    juntas), espera um pouquinho pra juntar todas antes de enviar,
+    evitando uma bolha gigante empilhada por foto no tópico.
+    """
+    if not msg.photo or not msg.media_group_id:
+        await encaminhar_mensagem(msg, context, destino, cabecalho, thread_id=thread_id)
+        return
+
+    media_group_id = msg.media_group_id
+    _media_groups_pendentes.setdefault(media_group_id, []).append(msg)
+
+    # "Debounce": cancela o timer anterior desse álbum (se existir) e cria
+    # um novo — só dispara de verdade quando parar de chegar foto nova.
+    nome_job = f"flush_album_{media_group_id}"
+    for job in context.job_queue.get_jobs_by_name(nome_job):
+        job.schedule_removal()
+    context.job_queue.run_once(
+        _flush_media_group,
+        when=1.5,
+        name=nome_job,
+        data={
+            "media_group_id": media_group_id,
+            "destino": destino,
+            "thread_id": thread_id,
+            "cabecalho": cabecalho,
+            "protocolo": protocolo,
+        },
+    )
 
 
 async def alerta_espera_job(context: ContextTypes.DEFAULT_TYPE):
