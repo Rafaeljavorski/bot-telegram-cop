@@ -1,4 +1,5 @@
 import os
+import asyncio
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -104,6 +105,13 @@ except Exception as e:
 
 usuarios_em_chamado = {}
 painel_message_id = None
+
+# Quando o técnico manda várias fotos juntas como álbum, o Telegram entrega
+# tudo quase ao mesmo tempo e o bot processa em paralelo (concurrent_updates
+# do PTB) — sem essa trava, duas fotos podem "correr" e nenhuma vê a
+# contagem/mensagem que a outra acabou de criar. Uma trava por técnico
+# serializa só essa seção, sem travar o bot inteiro pros outros técnicos.
+_locks_evidencia = {}
 
 
 def eh_admin(user_id: int) -> bool:
@@ -2453,52 +2461,60 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if msg.photo or msg.document or msg.video or msg.location or msg.voice or msg.text:
-            msg_type, file_id, text = tipo_mensagem(msg)
+            lock = _locks_evidencia.setdefault(user.id, asyncio.Lock())
+            async with lock:
+                # Releitura do ticket AQUI DENTRO da trava — a leitura lá em
+                # cima (antes da trava) pode já estar desatualizada se outra
+                # foto do mesmo álbum acabou de gravar um `fotos` mais novo
+                # enquanto essa mensagem esperava a vez.
+                ticket_atual = buscar_ticket(protocolo) or ticket
 
-            if msg_type in ["photo", "document", "video", "location"]:
-                fotos = (ticket.get("fotos") or 0) + 1
-            else:
-                fotos = ticket.get("fotos") or 0
+                msg_type, file_id, text = tipo_mensagem(msg)
 
-            atualizar_ticket(protocolo, fotos=fotos, last_message_at=now())
-            registrar_msg(
-                protocolo,
-                user.id,
-                user.full_name,
-                "tecnico",
-                msg_type,
-                text,
-                file_id=file_id,
-                latitude=msg.location.latitude if msg.location else None,
-                longitude=msg.location.longitude if msg.location else None,
-            )
+                if msg_type in ["photo", "document", "video", "location"]:
+                    fotos = (ticket_atual.get("fotos") or 0) + 1
+                else:
+                    fotos = ticket_atual.get("fotos") or 0
 
-            texto_evidencia = f"✅ Evidência recebida. Total: {fotos}\n\nToque em *✅ Finalizar fotos* quando terminar."
-            msg_id_existente = context.user_data.get("msg_id_evidencias")
+                atualizar_ticket(protocolo, fotos=fotos, last_message_at=now())
+                registrar_msg(
+                    protocolo,
+                    user.id,
+                    user.full_name,
+                    "tecnico",
+                    msg_type,
+                    text,
+                    file_id=file_id,
+                    latitude=msg.location.latitude if msg.location else None,
+                    longitude=msg.location.longitude if msg.location else None,
+                )
 
-            if msg_id_existente:
-                # Já existe uma mensagem de confirmação nessa leva de fotos —
-                # edita ela em vez de mandar outra, pra não empilhar uma
-                # mensagem idêntica pra cada foto que o técnico manda.
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=user.id,
-                        message_id=msg_id_existente,
-                        text=texto_evidencia,
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    # Mensagem pode ter passado da janela de edição do
-                    # Telegram, ter sido apagada, etc. -- manda uma nova e
-                    # passa a rastrear ela dali pra frente.
-                    logger.warning("Não consegui editar a confirmação de evidência, mandando nova: %s", e)
+                texto_evidencia = f"✅ Evidência recebida. Total: {fotos}\n\nToque em *✅ Finalizar fotos* quando terminar."
+                msg_id_existente = context.user_data.get("msg_id_evidencias")
+
+                if msg_id_existente:
+                    # Já existe uma mensagem de confirmação nessa leva de fotos —
+                    # edita ela em vez de mandar outra, pra não empilhar uma
+                    # mensagem idêntica pra cada foto que o técnico manda.
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=user.id,
+                            message_id=msg_id_existente,
+                            text=texto_evidencia,
+                            parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        # Mensagem pode ter passado da janela de edição do
+                        # Telegram, ter sido apagada, etc. -- manda uma nova e
+                        # passa a rastrear ela dali pra frente.
+                        logger.warning("Não consegui editar a confirmação de evidência, mandando nova: %s", e)
+                        teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
+                        nova_msg = await msg.reply_text(texto_evidencia, parse_mode="Markdown", reply_markup=teclado)
+                        context.user_data["msg_id_evidencias"] = nova_msg.message_id
+                else:
                     teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
                     nova_msg = await msg.reply_text(texto_evidencia, parse_mode="Markdown", reply_markup=teclado)
                     context.user_data["msg_id_evidencias"] = nova_msg.message_id
-            else:
-                teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
-                nova_msg = await msg.reply_text(texto_evidencia, parse_mode="Markdown", reply_markup=teclado)
-                context.user_data["msg_id_evidencias"] = nova_msg.message_id
             return
 
     await msg.reply_text("Use /start para iniciar um novo atendimento.")
