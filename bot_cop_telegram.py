@@ -2075,6 +2075,7 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["etapa"] = "fotos"
+        context.user_data.pop("msg_id_evidencias", None)
         teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
 
         await msg.reply_text(
@@ -2314,6 +2315,7 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             context.user_data["etapa"] = "fotos"
+            context.user_data.pop("msg_id_evidencias", None)
             teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
             await msg.reply_text(
                 "✅ Localização recebida.\n\n"
@@ -2471,12 +2473,32 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 longitude=msg.location.longitude if msg.location else None,
             )
 
-            teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
-            await msg.reply_text(
-                f"✅ Evidência recebida. Total: {fotos}\n\nToque em *✅ Finalizar fotos* quando terminar.",
-                parse_mode="Markdown",
-                reply_markup=teclado,
-            )
+            texto_evidencia = f"✅ Evidência recebida. Total: {fotos}\n\nToque em *✅ Finalizar fotos* quando terminar."
+            msg_id_existente = context.user_data.get("msg_id_evidencias")
+
+            if msg_id_existente:
+                # Já existe uma mensagem de confirmação nessa leva de fotos —
+                # edita ela em vez de mandar outra, pra não empilhar uma
+                # mensagem idêntica pra cada foto que o técnico manda.
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user.id,
+                        message_id=msg_id_existente,
+                        text=texto_evidencia,
+                        parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    # Mensagem pode ter passado da janela de edição do
+                    # Telegram, ter sido apagada, etc. -- manda uma nova e
+                    # passa a rastrear ela dali pra frente.
+                    logger.warning("Não consegui editar a confirmação de evidência, mandando nova: %s", e)
+                    teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
+                    nova_msg = await msg.reply_text(texto_evidencia, parse_mode="Markdown", reply_markup=teclado)
+                    context.user_data["msg_id_evidencias"] = nova_msg.message_id
+            else:
+                teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
+                nova_msg = await msg.reply_text(texto_evidencia, parse_mode="Markdown", reply_markup=teclado)
+                context.user_data["msg_id_evidencias"] = nova_msg.message_id
             return
 
     await msg.reply_text("Use /start para iniciar um novo atendimento.")
