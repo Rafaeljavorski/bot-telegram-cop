@@ -2508,12 +2508,16 @@ async def tratar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         # Telegram, ter sido apagada, etc. -- manda uma nova e
                         # passa a rastrear ela dali pra frente.
                         logger.warning("Não consegui editar a confirmação de evidência, mandando nova: %s", e)
-                        teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
-                        nova_msg = await msg.reply_text(texto_evidencia, parse_mode="Markdown", reply_markup=teclado)
+                        # SEM reply_markup aqui de propósito: o teclado "✅
+                        # Finalizar fotos" já foi mostrado uma vez, lá na
+                        # mensagem de entrada do fluxo de fotos, e o Telegram
+                        # não deixa editar uma mensagem que carrega um teclado
+                        # (reply keyboard) — era exatamente isso que fazia a
+                        # edição falhar sempre.
+                        nova_msg = await msg.reply_text(texto_evidencia, parse_mode="Markdown")
                         context.user_data["msg_id_evidencias"] = nova_msg.message_id
                 else:
-                    teclado = ReplyKeyboardMarkup([["✅ Finalizar fotos"]], resize_keyboard=True, one_time_keyboard=False)
-                    nova_msg = await msg.reply_text(texto_evidencia, parse_mode="Markdown", reply_markup=teclado)
+                    nova_msg = await msg.reply_text(texto_evidencia, parse_mode="Markdown")
                     context.user_data["msg_id_evidencias"] = nova_msg.message_id
             return
 
